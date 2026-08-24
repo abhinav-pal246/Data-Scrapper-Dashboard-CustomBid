@@ -151,7 +151,35 @@ def build_payload(page, token):
     return {"payload": _json.dumps(payload_obj), "csrf_bd_gem_nk": token}
 
 
-def fetch_listing_page(session, page, token):
+def _first(v):
+    """Solr fields arrive as single-item lists — unwrap them."""
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
+
+
+def resolve_target(doc):
+    """
+    Map one listing record to the document that actually holds the GeMARPTS
+    data. Active custom bids are often RA (Reverse Auction) entries whose own
+    showbidDocument is EMPTY — the real PDF lives under their parent bid
+    (GEM/…/B/…). So prefer the parent id + parent bid number when present.
+
+    Returns (pdf_doc_id, bid_no) as strings.
+    """
+    own_id = _first(doc.get("id")) or _first(doc.get("b_id"))
+    own_no = _first(doc.get("b_bid_number")) or ""
+
+    par_id = _first(doc.get("b_id_parent"))
+    par_no = _first(doc.get("b_bid_number_parent")) or ""
+
+    if par_id:
+        return str(par_id), (par_no or own_no)
+    return str(own_id) if own_id else None, own_no
+
+
+def fetch_listing_docs(session, page, token):
+    """Return the raw listing records for a page (for parent resolution)."""
     data = build_payload(page, token)
     r = session.post(LISTING_URL, data=data, headers=LISTING_HEADERS,
                      timeout=REQUEST_TIMEOUT)
@@ -160,15 +188,25 @@ def fetch_listing_page(session, page, token):
         j = r.json()
     except ValueError:
         return []
-    docs = (((j or {}).get("response") or {}).get("response") or {}).get("docs") or []
-    ids = []
-    for d in docs:
-        doc_id = d.get("id")
-        if not doc_id and d.get("b_id"):
-            doc_id = d["b_id"][0]
-        if doc_id:
-            ids.append(str(doc_id))
-    return ids
+    return (((j or {}).get("response") or {}).get("response") or {}).get("docs") or []
+
+
+def fetch_listing_targets(session, page, token):
+    """
+    Return [(pdf_doc_id, bid_no), …] for one listing page — each already
+    resolved to the parent document that carries the GeMARPTS PDF.
+    """
+    targets = []
+    for d in fetch_listing_docs(session, page, token):
+        pdf_id, bid_no = resolve_target(d)
+        if pdf_id:
+            targets.append((pdf_id, bid_no))
+    return targets
+
+
+def fetch_listing_page(session, page, token):
+    """Back-compat: page of resolved PDF doc-ids (parent-aware)."""
+    return [pdf_id for pdf_id, _ in fetch_listing_targets(session, page, token)]
 
 
 def collect_ids_to_file(session, out_path=IDS_FILE):

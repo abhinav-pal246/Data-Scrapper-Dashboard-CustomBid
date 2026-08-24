@@ -16,7 +16,7 @@ Run:
     python3 match.py
 """
 
-import csv, os, pickle, re, time
+import csv, os, pickle, re, time, hashlib
 import numpy as np
 from rapidfuzz import process as fuzz_process, fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -82,6 +82,17 @@ def generate_reason(custom_item, matched_category, verdict):
             "The custom bid may fit this category despite different naming."
         )
 
+    elif verdict == "Weak — review":
+        if keyword_phrase:
+            return (
+                f"Closest catalogue category by meaning ({keyword_phrase}), but below the "
+                f"confidence threshold — verify manually before treating it as a category match."
+            )
+        return (
+            "Closest catalogue category by meaning, but below the confidence threshold — "
+            "likely a genuine catalogue gap; verify manually before treating it as a match."
+        )
+
     return "Inconclusive match — manual review recommended."
 
 
@@ -96,34 +107,54 @@ def format_score(score, verdict):
 
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-def load_categories():
+CATEGORY_BID_RE = re.compile(r"GEM/\d{4}/[A-Z]/\d+", re.IGNORECASE)
+
+
+def load_categories(limit=None):
     """
-    Loads category_bids.csv.
+    Loads category_bids.csv, keeping only *working* categories — i.e. ones with
+    a valid, traceable Category Bid No (matching GEM/YYYY/L/NNN). Categories
+    without a usable bid no are skipped, since a match to them wouldn't be
+    traceable back to a real category bid on GeM.
+
+    Args:
+        limit — if set, keep only the first N working categories.
+
     Returns:
         categories_original  — list of category names (for matching)
         category_bid_map     — dict {category_name: Category Bid No}
     """
     categories_original = []
     category_bid_map    = {}
+    skipped             = 0
 
     with open(CATEGORY_CSV, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             name   = (row.get("Category Name") or "").strip()
-            bid_no = (row.get("Category Bid No") or "—").strip()
-            if name:
-                categories_original.append(name)
-                category_bid_map[name] = bid_no
+            bid_no = (row.get("Category Bid No") or "").strip()
+            if not name:
+                continue
+            if not CATEGORY_BID_RE.search(bid_no):
+                skipped += 1
+                continue
+            categories_original.append(name)
+            category_bid_map[name] = bid_no
+            if limit is not None and len(categories_original) >= limit:
+                break
 
-    print(f"Loaded {len(categories_original)} standard categories from {CATEGORY_CSV}")
+    print(f"Loaded {len(categories_original)} working categories from {CATEGORY_CSV}"
+          f" ({skipped} skipped — no valid Category Bid No)")
     return categories_original, category_bid_map
 
 
-def load_custom_bids():
+def load_custom_bids(limit=None):
     rows = []
     with open(INPUT_CSV, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if any(row.values()):
                 rows.append(row)
+                if limit is not None and len(rows) >= limit:
+                    break
     print(f"Loaded {len(rows)} custom bids from {INPUT_CSV}")
     return rows
 
@@ -183,6 +214,230 @@ def layer3_embeddings(item, model, cat_embeddings, categories_original):
     if best_score >= EMBEDDING_THRESHOLD:
         return categories_original[best_idx], round(best_score, 3)
     return None, 0
+
+
+# ── Shared model (loaded once, reused across API calls) ─────────────────────────
+_MODEL = None
+EMB_CACHE_DIR = "emb_cache"      # per-category-set embedding cache on disk
+_EMB_MEM      = {}               # in-memory embedding cache {hash: ndarray}
+ENCODE_BATCH  = 256              # texts encoded per model.encode() call
+COSINE_CHUNK  = 512              # items per cosine-similarity chunk (memory cap)
+
+
+def get_model():
+    """Lazily load the sentence-transformer once and reuse it."""
+    global _MODEL
+    if _MODEL is None:
+        print(f"Loading sentence transformer ({MODEL_NAME})...")
+        _MODEL = SentenceTransformer(MODEL_NAME)
+    return _MODEL
+
+
+def _noop(**_kwargs):
+    """Default progress sink."""
+    pass
+
+
+def encode_in_batches(model, texts, progress=_noop, phase="Encoding"):
+    """Encode texts in batches, reporting progress after each batch."""
+    n = len(texts)
+    progress(phase=phase, encoded=0, encode_total=n)
+    if n == 0:
+        return np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+
+    chunks = []
+    for i in range(0, n, ENCODE_BATCH):
+        vecs = model.encode(
+            texts[i:i + ENCODE_BATCH],
+            batch_size=ENCODE_BATCH, convert_to_numpy=True,
+        )
+        chunks.append(vecs)
+        progress(encoded=min(i + ENCODE_BATCH, n))
+    return np.vstack(chunks)
+
+
+def get_category_embeddings(categories, model, progress=_noop):
+    """
+    Return embeddings for `categories`, cached by a hash of the exact set so
+    any slice (or the full 14k catalogue) is encoded only once, then reused
+    across requests and process restarts.
+    """
+    key  = hashlib.md5("\n".join(categories).encode("utf-8")).hexdigest()
+    if key in _EMB_MEM:
+        return _EMB_MEM[key]
+
+    path = os.path.join(EMB_CACHE_DIR, f"{key}.npy")
+    if os.path.exists(path):
+        emb = np.load(path)
+        _EMB_MEM[key] = emb
+        return emb
+
+    emb = encode_in_batches(model, categories, progress, phase="Encoding categories")
+    os.makedirs(EMB_CACHE_DIR, exist_ok=True)
+    np.save(path, emb)
+    _EMB_MEM[key] = emb
+    return emb
+
+
+def _best_match_chunked(item_vectors, cat_matrix, threshold, always=False):
+    """
+    For each item vector, return the best-matching (category_index, score).
+    When `always` is False, entries below `threshold` come back as (None, 0.0);
+    when True, the nearest candidate is always returned regardless of score
+    (used to surface the closest category even for weak matches).
+    Processes items in chunks so the similarity matrix never blows up memory
+    at 14k × 14k. Works for both sparse (TF-IDF) and dense (embedding) inputs.
+    """
+    n = item_vectors.shape[0]
+    out = []
+    for i in range(0, n, COSINE_CHUNK):
+        chunk = item_vectors[i:i + COSINE_CHUNK]
+        sims  = cosine_similarity(chunk, cat_matrix)       # (chunk × n_cat)
+        best_idx   = sims.argmax(axis=1)
+        best_score = sims[np.arange(sims.shape[0]), best_idx]
+        for idx, sc in zip(best_idx, best_score):
+            if always or sc >= threshold:
+                out.append((int(idx), float(sc)))
+            else:
+                out.append((None, 0.0))
+    return out
+
+
+def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
+                     output_csv="compare_output.csv", progress=_noop,
+                     custom_rows=None):
+    """
+    Batched, cached, progress-aware matching pipeline — built to scale to
+    ~14k custom bids × ~14k categories.
+
+    Runs the same three layers as the CLI, but layer-at-a-time across ALL
+    remaining items (vectorized TF-IDF / embedding cosine, batched encoding)
+    instead of one item at a time.
+
+    `progress(**fields)` is called throughout to update a shared status dict.
+
+    `custom_rows`, when given, is the list of custom-bid dicts to match
+    (each with "Bid No" + "Item Category") — used when the caller has already
+    collected them on demand. When None, they are read from INPUT_CSV.
+
+    Returns the list of result-row dicts (also written to `output_csv`).
+    """
+    if compare_all:
+        category_limit = None
+        if custom_rows is None:
+            custom_limit = None
+
+    progress(phase="Loading data")
+    categories_original, category_bid_map = load_categories(limit=category_limit)
+    categories_clean = [clean(c) for c in categories_original]
+    custom_bids      = custom_rows if custom_rows is not None \
+        else load_custom_bids(limit=custom_limit)
+
+    # Keep only rows that actually carry an item, preserving order + bid nos.
+    items = []   # list of (bid_no, item_raw, item_clean)
+    for row in custom_bids:
+        item_raw = (row.get("Item Category") or "").strip()
+        if not item_raw:
+            continue
+        items.append(((row.get("Bid No") or "—").strip() or "—",
+                      item_raw, clean(item_raw)))
+
+    total = len(items)
+    progress(phase="Matching", total=total, processed=0, matched=0)
+
+    # match_info[i] = (matched_category_or_None, score, verdict, layer_label)
+    match_info = [None] * total
+    pending    = list(range(total))   # indices still needing a match
+
+    # ── Layer 1 — fuzzy (per item; rapidfuzz scans categories in C) ───────────
+    progress(phase="Layer 1 · fuzzy string matching")
+    still = []
+    for count, i in enumerate(pending, 1):
+        m, s = layer1_fuzzy(items[i][2], categories_clean, categories_original)
+        if m:
+            match_info[i] = (m, s, "Strong match", "Layer 1 · fuzzy string (token-sort)")
+        else:
+            still.append(i)
+        if count % 200 == 0 or count == len(pending):
+            progress(processed=count)
+    pending = still
+
+    # ── Layer 2 — TF-IDF cosine (vectorized, chunked) ─────────────────────────
+    if pending:
+        progress(phase="Layer 2 · TF-IDF cosine similarity")
+        vectorizer, tfidf_matrix = build_tfidf(categories_clean)
+        item_vecs = vectorizer.transform([items[i][2] for i in pending])
+        results2  = _best_match_chunked(item_vecs, tfidf_matrix, TFIDF_THRESHOLD)
+        still = []
+        for i, (idx, sc) in zip(pending, results2):
+            if idx is not None:
+                match_info[i] = (categories_original[idx], round(sc, 3),
+                                 "Likely match", "Layer 2 · TF-IDF cosine (n-gram 1-3)")
+            else:
+                still.append(i)
+        pending = still
+
+    # ── Layer 3 — sentence embeddings (batched encode, chunked cosine) ────────
+    if pending:
+        progress(phase="Layer 3 · sentence embeddings")
+        model          = get_model()
+        cat_embeddings = get_category_embeddings(categories_original, model, progress)
+
+        item_embeddings = encode_in_batches(
+            model, [items[i][1] for i in pending], progress, phase="Encoding custom items"
+        )
+        # always=True → every item gets its nearest category, even below threshold,
+        # so the Matched Category / Category Bid No columns are never empty.
+        results3 = _best_match_chunked(item_embeddings, cat_embeddings,
+                                       EMBEDDING_THRESHOLD, always=True)
+        for i, (idx, sc) in zip(pending, results3):
+            cat = categories_original[idx]
+            if sc >= EMBEDDING_THRESHOLD:
+                match_info[i] = (cat, round(sc, 3), "Possible match",
+                                 "Layer 3 · sentence embeddings (semantic)")
+            else:
+                # nearest catalogue category, but below the confidence bar
+                match_info[i] = (cat, round(sc, 3), "Weak — review",
+                                 "Nearest · below confidence threshold")
+
+    # ── Assemble results in original order ────────────────────────────────────
+    progress(phase="Building results")
+    results  = []
+    matched_n = 0
+    for i, (bid_no, item_raw, _clean) in enumerate(items):
+        match, score, verdict, layer = match_info[i]
+        if match:
+            matched_n += 1
+        reason = generate_reason(item_raw, match or "", verdict)
+        if layer:
+            reason = f"[{layer}] {reason}"
+        results.append({
+            "Custom Bid No"       : bid_no,
+            "Custom Item"         : item_raw,
+            "Matched Category"    : match or "—",
+            "Category Bid No"     : category_bid_map.get(match, "—") if match else "—",
+            "Why It Could Belong" : reason,
+            "Score"               : format_score(score, verdict),
+        })
+
+    # Always write the full CSV so the frontend can offer a download.
+    progress(phase="Writing CSV", processed=total, matched=matched_n)
+    fieldnames = ["Custom Bid No", "Custom Item", "Matched Category",
+                  "Category Bid No", "Why It Could Belong", "Score"]
+    with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"API comparison: {total} custom bids vs "
+          f"{len(categories_original)} categories → {output_csv}  ({matched_n} matched)")
+    return results
+
+
+def run_matching_api(custom_limit=None, category_limit=None,
+                     compare_all=False, output_csv="compare_output.csv"):
+    """Synchronous wrapper (no progress) — kept for direct/scripted use."""
+    return run_matching_job(custom_limit, category_limit, compare_all, output_csv)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
