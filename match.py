@@ -25,7 +25,7 @@ from sentence_transformers import SentenceTransformer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 INPUT_CSV        = "gemarpts_output.csv"
-CATEGORY_CSV     = "category_bids.csv"     # ← now a CSV with bid nos
+CATEGORY_CSV     = "category_reference.csv"  # ← static category list (Name,URL,Created At)
 OUTPUT_CSV       = "match_output.csv"
 EMBEDDINGS_CACHE = "category_embeddings.pkl"
 
@@ -112,39 +112,35 @@ CATEGORY_BID_RE = re.compile(r"GEM/\d{4}/[A-Z]/\d+", re.IGNORECASE)
 
 def load_categories(limit=None):
     """
-    Loads category_bids.csv, keeping only *working* categories — i.e. ones with
-    a valid, traceable Category Bid No (matching GEM/YYYY/L/NNN). Categories
-    without a usable bid no are skipped, since a match to them wouldn't be
-    traceable back to a real category bid on GeM.
+    Loads the static category reference CSV (columns: Name, URL, Created At).
+    The category list is now a fixed file provided by the user — no live
+    scraping. Deduplicates by name, preserving order.
 
     Args:
-        limit — if set, keep only the first N working categories.
+        limit — if set, keep only the first N categories.
 
     Returns:
         categories_original  — list of category names (for matching)
-        category_bid_map     — dict {category_name: Category Bid No}
+        category_url_map     — dict {category_name: search URL} (for reference)
     """
     categories_original = []
-    category_bid_map    = {}
-    skipped             = 0
+    category_url_map    = {}
+    seen                = set()
 
     with open(CATEGORY_CSV, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            name   = (row.get("Category Name") or "").strip()
-            bid_no = (row.get("Category Bid No") or "").strip()
-            if not name:
+            name = (row.get("Name") or row.get("Category Name") or "").strip()
+            url  = (row.get("URL") or "").strip()
+            if not name or name in seen:
                 continue
-            if not CATEGORY_BID_RE.search(bid_no):
-                skipped += 1
-                continue
+            seen.add(name)
             categories_original.append(name)
-            category_bid_map[name] = bid_no
+            category_url_map[name] = url
             if limit is not None and len(categories_original) >= limit:
                 break
 
-    print(f"Loaded {len(categories_original)} working categories from {CATEGORY_CSV}"
-          f" ({skipped} skipped — no valid Category Bid No)")
-    return categories_original, category_bid_map
+    print(f"Loaded {len(categories_original)} categories from {CATEGORY_CSV}")
+    return categories_original, category_url_map
 
 
 def load_custom_bids(limit=None):
@@ -238,8 +234,12 @@ def _noop(**_kwargs):
     pass
 
 
-def encode_in_batches(model, texts, progress=_noop, phase="Encoding"):
-    """Encode texts in batches, reporting progress after each batch."""
+def _noop_cp():
+    pass
+
+
+def encode_in_batches(model, texts, progress=_noop, phase="Encoding", checkpoint=_noop_cp):
+    """Encode texts in batches, reporting progress (and honouring pause/cancel)."""
     n = len(texts)
     progress(phase=phase, encoded=0, encode_total=n)
     if n == 0:
@@ -247,6 +247,7 @@ def encode_in_batches(model, texts, progress=_noop, phase="Encoding"):
 
     chunks = []
     for i in range(0, n, ENCODE_BATCH):
+        checkpoint()
         vecs = model.encode(
             texts[i:i + ENCODE_BATCH],
             batch_size=ENCODE_BATCH, convert_to_numpy=True,
@@ -256,7 +257,7 @@ def encode_in_batches(model, texts, progress=_noop, phase="Encoding"):
     return np.vstack(chunks)
 
 
-def get_category_embeddings(categories, model, progress=_noop):
+def get_category_embeddings(categories, model, progress=_noop, checkpoint=_noop_cp):
     """
     Return embeddings for `categories`, cached by a hash of the exact set so
     any slice (or the full 14k catalogue) is encoded only once, then reused
@@ -272,7 +273,8 @@ def get_category_embeddings(categories, model, progress=_noop):
         _EMB_MEM[key] = emb
         return emb
 
-    emb = encode_in_batches(model, categories, progress, phase="Encoding categories")
+    emb = encode_in_batches(model, categories, progress,
+                            phase="Encoding categories", checkpoint=checkpoint)
     os.makedirs(EMB_CACHE_DIR, exist_ok=True)
     np.save(path, emb)
     _EMB_MEM[key] = emb
@@ -305,7 +307,7 @@ def _best_match_chunked(item_vectors, cat_matrix, threshold, always=False):
 
 def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
                      output_csv="compare_output.csv", progress=_noop,
-                     custom_rows=None):
+                     custom_rows=None, checkpoint=_noop_cp):
     """
     Batched, cached, progress-aware matching pipeline — built to scale to
     ~14k custom bids × ~14k categories.
@@ -328,19 +330,26 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
             custom_limit = None
 
     progress(phase="Loading data")
-    categories_original, category_bid_map = load_categories(limit=category_limit)
+    categories_original, category_url_map = load_categories(limit=category_limit)
     categories_clean = [clean(c) for c in categories_original]
     custom_bids      = custom_rows if custom_rows is not None \
         else load_custom_bids(limit=custom_limit)
 
-    # Keep only rows that actually carry an item, preserving order + bid nos.
-    items = []   # list of (bid_no, item_raw, item_clean)
+    # Carry over EVERY column from the Custom Bid Extractor output. Keep only
+    # rows that actually carry an item, preserving order.
+    DEFAULT_FIELDS = ["Bid No", "Item Category", "Searched Strings",
+                      "Searched Result", "Relevant Categories"]
+    custom_fields = []
+    items = []   # list of (full_row, item_raw, item_clean)
     for row in custom_bids:
         item_raw = (row.get("Item Category") or "").strip()
         if not item_raw:
             continue
-        items.append(((row.get("Bid No") or "—").strip() or "—",
-                      item_raw, clean(item_raw)))
+        if not custom_fields:
+            custom_fields = [k for k in row.keys() if k] or DEFAULT_FIELDS
+        items.append((row, item_raw, clean(item_raw)))
+    if not custom_fields:
+        custom_fields = DEFAULT_FIELDS
 
     total = len(items)
     progress(phase="Matching", total=total, processed=0, matched=0)
@@ -359,11 +368,13 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
         else:
             still.append(i)
         if count % 200 == 0 or count == len(pending):
+            checkpoint()
             progress(processed=count)
     pending = still
 
     # ── Layer 2 — TF-IDF cosine (vectorized, chunked) ─────────────────────────
     if pending:
+        checkpoint()
         progress(phase="Layer 2 · TF-IDF cosine similarity")
         vectorizer, tfidf_matrix = build_tfidf(categories_clean)
         item_vecs = vectorizer.transform([items[i][2] for i in pending])
@@ -379,12 +390,14 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
 
     # ── Layer 3 — sentence embeddings (batched encode, chunked cosine) ────────
     if pending:
+        checkpoint()
         progress(phase="Layer 3 · sentence embeddings")
         model          = get_model()
-        cat_embeddings = get_category_embeddings(categories_original, model, progress)
+        cat_embeddings = get_category_embeddings(categories_original, model, progress, checkpoint)
 
         item_embeddings = encode_in_batches(
-            model, [items[i][1] for i in pending], progress, phase="Encoding custom items"
+            model, [items[i][1] for i in pending], progress,
+            phase="Encoding custom items", checkpoint=checkpoint,
         )
         # always=True → every item gets its nearest category, even below threshold,
         # so the Matched Category / Category Bid No columns are never empty.
@@ -401,36 +414,32 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
                                  "Nearest · below confidence threshold")
 
     # ── Assemble results in original order ────────────────────────────────────
+    # Output = every Custom Bid Extractor column carried over as-is, plus the
+    # matched category (from the static CSV), the strength label, and the score.
     progress(phase="Building results")
-    results  = []
+    results   = []
     matched_n = 0
-    for i, (bid_no, item_raw, _clean) in enumerate(items):
-        match, score, verdict, layer = match_info[i]
-        if match:
+    CONFIDENT = {"Strong match", "Likely match", "Possible match"}
+    for i, (row, item_raw, _clean) in enumerate(items):
+        match, score, verdict, _layer = match_info[i]
+        if verdict in CONFIDENT:
             matched_n += 1
-        reason = generate_reason(item_raw, match or "", verdict)
-        if layer:
-            reason = f"[{layer}] {reason}"
-        results.append({
-            "Custom Bid No"       : bid_no,
-            "Custom Item"         : item_raw,
-            "Matched Category"    : match or "—",
-            "Category Bid No"     : category_bid_map.get(match, "—") if match else "—",
-            "Why It Could Belong" : reason,
-            "Score"               : format_score(score, verdict),
-        })
+        out = {k: (row.get(k, "") or "") for k in custom_fields}
+        out["Matched Category"] = match or "—"
+        out["Match Label"]      = verdict or "No match"
+        out["Match Score"]      = format_score(score, verdict)
+        results.append(out)
 
     # Always write the full CSV so the frontend can offer a download.
     progress(phase="Writing CSV", processed=total, matched=matched_n)
-    fieldnames = ["Custom Bid No", "Custom Item", "Matched Category",
-                  "Category Bid No", "Why It Could Belong", "Score"]
+    fieldnames = custom_fields + ["Matched Category", "Match Label", "Match Score"]
     with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"API comparison: {total} custom bids vs "
-          f"{len(categories_original)} categories → {output_csv}  ({matched_n} matched)")
+    print(f"Comparison: {total} custom bids vs {len(categories_original)} "
+          f"categories → {output_csv}  ({matched_n} confident matches)")
     return results
 
 

@@ -3,11 +3,16 @@ from flask_cors import CORS
 import threading
 import os
 import time
+import csv as _csv
+import requests
 
 from gem_gemarpts_scraper import (
     process_one, build_session, append_row,
     load_processed_bids, prime_session, fetch_listing_page,
     fetch_listing_targets
+)
+from collect_categories import (
+    fetch_product_ids_page, fetch_pdf_bytes as cat_fetch_pdf, extract_from_pdf
 )
 from match import run_matching_job
 
@@ -16,6 +21,151 @@ CORS(app)
 
 COMPARE_CSV       = "compare_output.csv"
 INLINE_ROW_LIMIT  = 300     # results at/below this are shown in the dashboard
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Pausable job framework — shared by Custom Extractor, Category Extractor and
+#  the Comparison pipeline so Pause / Resume / Cancel behave identically.
+#
+#    Start  = fresh run (overwrites that module's output)
+#    Pause  = stop but keep everything collected so far (already on disk) and
+#             hold position; the worker thread stays alive for instant resume
+#    Resume = continue the SAME job, appending — final file = old + new
+#    Cancel = discard the current partial run and reset so a new range can start
+# ══════════════════════════════════════════════════════════════════════════════
+class _Cancelled(Exception):
+    """Raised inside a worker when the job has been cancelled."""
+
+
+MAX_AUTO_RETRIES = 4        # quick auto-retries on network/server errors before HOLD
+
+
+def _retry_guard(fn, *, checkpoint, update, cancelled, take_retry,
+                 label="", on_hold=None, cancel_exc=None):
+    """
+    Run fn(). On a transient network/server error (requests exceptions incl.
+    5xx), auto-retry with backoff up to MAX_AUTO_RETRIES; if still failing, go
+    on HOLD — all progress preserved — until a manual retry (take_retry() → True)
+    or cancel. Auto-retry and manual retry both re-run fn from the SAME point.
+    Non-network errors propagate to the caller (treated as permanent).
+    `cancel_exc` is the exception raised on cancel (per-module).
+    """
+    cancel_exc = cancel_exc or _Cancelled
+    attempt = 0
+    while True:
+        checkpoint()                                   # pause / cancel aware
+        try:
+            result = fn()
+            if attempt:
+                update(status="running", attempt=0, hold_reason="")
+            return result
+        except cancel_exc:
+            raise
+        except requests.exceptions.RequestException as e:
+            attempt += 1
+            reason = f"{label} — {type(e).__name__}".strip(" —")
+            if attempt < MAX_AUTO_RETRIES:
+                update(status="retrying", attempt=attempt,
+                       max_attempts=MAX_AUTO_RETRIES, hold_reason=reason)
+                deadline = time.time() + min(2 ** attempt, 20)   # interruptible backoff
+                while time.time() < deadline:
+                    if cancelled():
+                        raise cancel_exc()
+                    time.sleep(0.1)
+                continue
+            # auto-retries exhausted → HOLD (state preserved)
+            update(status="hold", attempt=attempt,
+                   max_attempts=MAX_AUTO_RETRIES, hold_reason=reason)
+            if on_hold:
+                try:
+                    on_hold()
+                except Exception as ex:
+                    print(f"on_hold hook failed: {ex}")
+            while True:
+                if cancelled():
+                    raise cancel_exc()
+                if take_retry():
+                    break                              # user pressed Retry
+                time.sleep(0.3)
+            update(status="running", attempt=0, hold_reason="")
+            attempt = 0                                # try fn again from here
+
+
+class JobControl:
+    def __init__(self):
+        self.lock       = threading.Lock()
+        self.pause_evt  = threading.Event()
+        self.cancel_evt = threading.Event()
+        self.retry_evt  = threading.Event()
+        self.thread     = None
+        self.state      = self._fresh()
+
+    @staticmethod
+    def _fresh():
+        return {"status": "idle", "phase": "", "collected": 0, "total": 0,
+                "written": 0, "failed": 0, "paused": False, "done": False,
+                "error": "", "attempt": 0, "max_attempts": MAX_AUTO_RETRIES,
+                "hold_reason": ""}
+
+    def reset(self):
+        with self.lock:
+            self.state = self._fresh()
+        self.pause_evt.clear()
+        self.cancel_evt.clear()
+        self.retry_evt.clear()
+
+    def update(self, **fields):
+        with self.lock:
+            self.state.update(fields)
+
+    def get(self):
+        with self.lock:
+            return dict(self.state)
+
+    def is_live(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def checkpoint(self, on_pause=None):
+        """
+        Called by a worker between units of work. Blocks while paused (keeping
+        the thread — and all its in-memory position — alive) and raises when
+        cancelled. `on_pause` runs once on entering the paused state (used by
+        the comparison to write a partial result so it can be exported).
+        """
+        if self.cancel_evt.is_set():
+            raise _Cancelled()
+        entered = False
+        while self.pause_evt.is_set() and not self.cancel_evt.is_set():
+            if not entered:
+                self.update(status="paused", paused=True)
+                if on_pause:
+                    try:
+                        on_pause()
+                    except Exception as e:
+                        print(f"on_pause hook failed: {e}")
+                entered = True
+            time.sleep(0.3)
+        if self.cancel_evt.is_set():
+            raise _Cancelled()
+        if entered:
+            self.update(status="running", paused=False)
+
+    def _take_retry(self):
+        if self.retry_evt.is_set():
+            self.retry_evt.clear()
+            return True
+        return False
+
+    def guard(self, fn, label="", on_pause=None):
+        """Wrap a network call with auto-retry → hold → manual-retry."""
+        return _retry_guard(
+            fn,
+            checkpoint=lambda: self.checkpoint(on_pause),
+            update=self.update,
+            cancelled=self.cancel_evt.is_set,
+            take_retry=self._take_retry,
+            label=label,
+        )
 
 # ── Comparison job state (separate from the scraper job) ──────────────────────
 def _fresh_compare_job():
@@ -34,10 +184,16 @@ def _fresh_compare_job():
         "inline":       False,
         "error":        "",
         "done":         False,
+        "paused":       False,
+        "attempt":      0,
+        "max_attempts": MAX_AUTO_RETRIES,
+        "hold_reason":  "",
     }
 
 compare_job     = _fresh_compare_job()
 compare_lock    = threading.Lock()
+compare_pause   = threading.Event()   # set = pause the comparison worker
+compare_retry   = threading.Event()   # set = manual retry from hold
 compare_results = []          # last run's rows, held in memory for /result
 
 
@@ -45,49 +201,74 @@ compare_results = []          # last run's rows, held in memory for /result
 CUSTOM_OUTPUT_CSV = "gemarpts_output.csv"   # Extractor's fresh output
 
 
-def collect_custom_bids(session, needed, compare_all, progress):
+def collect_custom_bids(session, needed, compare_all, progress,
+                        checkpoint=None, out_rows=None, guard=None):
     """
-    Collect custom bids FRESH from the live GeM listing every run — no cache,
-    no resume. Pages the ongoing Product Custom Bid/RA listing, extracts each
-    via its parent document (RA entries carry their GeMARPTS PDF on the parent
-    bid), and keeps ONLY active bids (a real PDF with an Item Category).
-    Expired/empty bids are skipped and never stored. Over-fetches past expired
-    ones until `needed` active bids are gathered (or all, for Compare All).
+    Collect custom bids from the live GeM listing, extracting each via its
+    parent document (RA entries carry their GeMARPTS PDF on the parent bid) and
+    keeping ONLY active bids (a real PDF with an Item Category). Over-fetches
+    past expired ones until `needed` active bids are gathered (or all).
+
+    `checkpoint()` — called each item for pause/cancel support.
+    `out_rows` — live list to append working bids to (partial export).
+    `guard(fn, label)` — wraps network calls with auto-retry → hold → retry.
 
     Returns the active custom-bid dicts ({"Bid No", "Item Category"}).
     """
-    rows       = []
+    rows       = out_rows if out_rows is not None else []
     failed     = 0
-    seen_bidno = set()
+    seen_bidno = {r["Bid No"] for r in rows}
     seen_ids   = set()
     unbounded  = compare_all or needed is None
     progress(phase="Collecting custom bids",
-             collect_total=(0 if unbounded else needed), collected=0, failed=0)
+             collect_total=(0 if unbounded else needed), collected=len(rows), failed=0)
 
-    token = prime_session(session)
-    page  = 1
-    while unbounded or len(rows) < needed:
+    tok = [prime_session(session)]
+
+    def _fetch_page():
         try:
-            targets = fetch_listing_targets(session, page, token)
+            return fetch_listing_targets(session, page, tok[0])
+        except requests.exceptions.RequestException:
+            tok[0] = prime_session(session)
+            return fetch_listing_targets(session, page, tok[0])
+
+    def _extract(pid, bno):
+        try:
+            return process_one(session, bno, pid)
+        except requests.exceptions.RequestException:
+            raise                            # transient → guard retries/holds
         except Exception:
-            token = prime_session(session)   # re-prime and retry the same page
-            time.sleep(1.5)
-            continue
+            return None                      # permanent → skip
+
+    page = 1
+    while unbounded or len(rows) < needed:
+        if checkpoint:
+            checkpoint()
+        if guard:
+            targets = guard(_fetch_page, "Fetching bid listing")
+        else:
+            try:
+                targets = _fetch_page()
+            except Exception:
+                time.sleep(1.5)
+                continue
         if not targets:
             break                            # listing exhausted
         page += 1
 
         for pdf_id, bid_no in targets:
+            if checkpoint:
+                checkpoint()
             if not unbounded and len(rows) >= needed:
                 break
             if pdf_id in seen_ids:
                 continue
             seen_ids.add(pdf_id)
 
-            try:
-                row = process_one(session, bid_no, pdf_id)
-            except Exception:
-                row = None
+            if guard:
+                row = guard(lambda: _extract(pdf_id, bid_no), "Fetching bid document")
+            else:
+                row = _extract(pdf_id, bid_no)
 
             item = (row or {}).get("item_category", "").strip() if row else ""
             resolved_no = (row or {}).get("bid_no", "") or bid_no
@@ -102,128 +283,315 @@ def collect_custom_bids(session, needed, compare_all, progress):
 
     return rows
 
-# ── Shared job state ──────────────────────────────────────────────────────────
-job = {
-    "status":    "idle",
-    "phase":     "",        # collecting | extracting
-    "collected": 0,         # IDs found so far (phase 1)
-    "total":     0,         # total to extract (phase 2)
-    "written":   0,
-    "failed":    0,
-    "done":      False,
-    "error":     ""
+# ══════════════════════════════════════════════════════════════════════════════
+#  Two extractor modules — Custom Bid + Category Bid — on the shared framework.
+# ══════════════════════════════════════════════════════════════════════════════
+import json
+
+CATEGORY_OUTPUT_CSV = "category_bids.csv"
+
+
+def _load_done_custom(path):
+    done = set()
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            for r in _csv.reader(f):
+                if r and r[0] and r[0] != "Bid No":
+                    done.add(r[0])
+    return done
+
+
+def _load_done_category(path):
+    done = set()
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            for r in _csv.DictReader(f):
+                b = (r.get("Category Bid No") or "").strip()
+                if b and b != "—":
+                    done.add(b)
+    return done
+
+
+def _extract_custom(session, pdf_id, listing_bid_no):
+    """
+    Extract a custom bid via its (parent) PDF. Returns (bid_no, writer) or None.
+    Transient network/server errors are re-raised so the retry/hold guard can
+    handle them; permanent problems (expired/empty PDF) return None (skip).
+    """
+    try:
+        row = process_one(session, listing_bid_no, pdf_id)
+    except requests.exceptions.RequestException:
+        raise                                    # transient → guard retries/holds
+    except Exception:
+        row = None                               # permanent → skip
+    item = (row or {}).get("item_category", "").strip() if row else ""
+    no   = (row or {}).get("bid_no", "") or listing_bid_no
+    if item and no:
+        return no, (lambda: append_row(CUSTOM_OUTPUT_CSV, row))
+    return None
+
+
+def _append_category_row(path, name, bid_no, doc_id):
+    new = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=["Category Name", "Category Bid No", "Doc ID"])
+        if new:
+            w.writeheader()
+        w.writerow({"Category Name": name, "Category Bid No": bid_no, "Doc ID": doc_id})
+
+
+def _extract_category(session, pdf_id, listing_bid_no):
+    """
+    Extract a true Category Bid (skips Custom Bids, which carry a GeMARPTS block).
+    Returns (bid_no, writer) or None.
+    """
+    try:
+        pdf = cat_fetch_pdf(session, pdf_id)
+    except requests.exceptions.RequestException:
+        raise                                    # transient → guard retries/holds
+    except Exception:
+        return None                              # permanent (empty/non-PDF) → skip
+    try:
+        item, bno, is_custom = extract_from_pdf(pdf)
+    except Exception:
+        return None
+    if is_custom or not item:
+        return None                          # custom or empty → ignore, don't store
+    no = bno or listing_bid_no or "—"
+    return no, (lambda: _append_category_row(CATEGORY_OUTPUT_CSV, item, no, pdf_id))
+
+
+# ── Module registry ───────────────────────────────────────────────────────────
+EXTRACTORS = {
+    "custom": {
+        "ctrl":      JobControl(),
+        "output":    CUSTOM_OUTPUT_CSV,
+        "dl_name":   "gem_gemarpts_data.csv",
+        "listing":   lambda s, p, t: fetch_listing_targets(s, p, t),   # parent-aware
+        "extract":   _extract_custom,
+        "load_done": _load_done_custom,
+        "meta":      "custom_meta.json",
+    },
+    "category": {
+        "ctrl":      JobControl(),
+        "output":    CATEGORY_OUTPUT_CSV,
+        "dl_name":   "category_bids.csv",
+        "listing":   lambda s, p, t: [(i, "") for i in fetch_product_ids_page(s, p, t)],
+        "extract":   _extract_category,
+        "load_done": _load_done_category,
+        "meta":      "category_meta.json",
+    },
 }
 
 
-# ── Background function ───────────────────────────────────────────────────────
-def run_scraper(count):
-    global job
+def _save_meta(cfg, target, is_all):
     try:
+        with open(cfg["meta"], "w") as f:
+            json.dump({"target": target, "is_all": is_all}, f)
+    except Exception:
+        pass
+
+
+def _load_meta(cfg):
+    try:
+        with open(cfg["meta"]) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _run_extractor(cfg, target, is_all, resume):
+    """
+    Fresh (resume=False) wipes the output first; resume=True keeps it and skips
+    bids already stored, so the final CSV is cumulative. Pages the live listing,
+    extracts active bids only, and honours pause/cancel at every step.
+    """
+    ctrl   = cfg["ctrl"]
+    output = cfg["output"]
+    try:
+        if resume and os.path.exists(output):
+            done = cfg["load_done"](output)          # keep prior session's data
+        else:
+            open(output, "w").close()                # fresh run
+            done = set()
+
+        written  = len(done)
+        failed   = 0
+        collected = 0
+        ctrl.update(status="running", phase="collecting", written=written,
+                    failed=0, collected=0, total=(target or 0),
+                    done=False, error="", paused=False)
+
         session = build_session()
-        is_all  = (count == "all")
-        target  = None if is_all else int(count)
+        token   = [prime_session(session)]           # boxed so nested fn can refresh it
+        seen_ids = set()
+        page     = 1
+        first    = True
 
-        # ── Fresh start: wipe previous output so each run reflects what is
-        #    live on GeM right now (no resume, no stale/expired bids kept). ──
-        open(CUSTOM_OUTPUT_CSV, "w").close()
+        def _fetch_page():
+            # Refresh the CSRF token on a transient failure, then let the guard
+            # decide whether to retry again or go on hold.
+            try:
+                return cfg["listing"](session, page, token[0])
+            except requests.exceptions.RequestException:
+                token[0] = prime_session(session)
+                return cfg["listing"](session, page, token[0])
 
-        job["phase"] = "collecting"
-        token        = prime_session(session)
-
-        # ── Page the live listing and extract as we go, keeping ONLY active
-        #    bids (real PDF via the parent doc). Expired/empty are skipped and
-        #    never stored. Over-fetch past expired until `target` active bids. ─
-        job["total"] = target or 0
-        seen_ids   = set()
-        seen_bidno = set()
-        page       = 1
-        first      = True
-
-        while is_all or job["written"] < target:
-            targets = fetch_listing_targets(session, page, token)
+        while True:
+            ctrl.checkpoint()
+            if not is_all and written >= target:
+                break
+            targets = ctrl.guard(_fetch_page, "Fetching bid listing")
             if not targets:
-                break                       # listing exhausted
+                break                                # listing exhausted
             page += 1
-            job["collected"] += len(targets)
+            collected += len(targets)
             if first:
-                job["phase"] = "extracting"
+                ctrl.update(phase="extracting")
                 first = False
-            if is_all:
-                job["total"] = job["collected"]
+            ctrl.update(collected=collected, total=(collected if is_all else target))
 
             for pdf_id, bid_no in targets:
-                if not is_all and job["written"] >= target:
+                ctrl.checkpoint()
+                if not is_all and written >= target:
                     break
                 if pdf_id in seen_ids:
                     continue
                 seen_ids.add(pdf_id)
 
-                try:
-                    row = process_one(session, bid_no, pdf_id)
-                except Exception:
-                    row = None
-
-                if row and row["bid_no"] not in seen_bidno:
-                    append_row(CUSTOM_OUTPUT_CSV, row)   # active bid → store
-                    seen_bidno.add(row["bid_no"])
-                    job["written"] += 1
+                res = ctrl.guard(lambda: cfg["extract"](session, pdf_id, bid_no),
+                                 "Fetching bid document")
+                if res and res[0] not in done:
+                    res[1]()                         # write the row
+                    done.add(res[0])
+                    written += 1
+                    ctrl.update(written=written)
                 else:
-                    job["failed"] += 1                   # expired/empty → ignore
+                    failed += 1                      # expired/custom/empty → skip
+                    ctrl.update(failed=failed)
 
                 time.sleep(1.5)
 
-        job["done"]   = True
-        job["status"] = "done"
+        ctrl.update(status="done", phase="done", done=True)
 
+    except _Cancelled:
+        ctrl.reset()                                 # discard partial, back to idle
     except Exception as e:
-        job["status"] = "error"
-        job["error"]  = str(e)
-        job["done"]   = True
+        ctrl.update(status="error", error=str(e), done=True)
 
 
-# ── Endpoint 1: Start ─────────────────────────────────────────────────────────
-@app.route("/api/start", methods=["POST"])
-def start():
-    global job
+# ── Extractor endpoints (mod = custom | category) ─────────────────────────────
+def _extractor_or_404(mod):
+    cfg = EXTRACTORS.get(mod)
+    return cfg
 
-    data  = request.get_json()
+
+@app.route("/api/extract/<mod>/start", methods=["POST"])
+def ext_start(mod):
+    cfg = _extractor_or_404(mod)
+    if not cfg:
+        return jsonify({"error": "Unknown module"}), 404
+    ctrl = cfg["ctrl"]
+    if ctrl.is_live() and not ctrl.get()["done"]:
+        return jsonify({"error": "A job is already running. Pause or cancel it first."}), 409
+
+    data  = request.get_json(silent=True) or {}
     count = data.get("count", "all")
+    is_all = (count == "all")
+    try:
+        target = None if is_all else int(count)
+    except (TypeError, ValueError):
+        target = None
+    if not is_all and (target is None or target <= 0):
+        return jsonify({"error": "Enter a valid number of bids, or choose ALL."}), 400
 
-    job = {
-        "status":    "running",
-        "phase":     "collecting",
-        "collected": 0,
-        "total":     0,
-        "written":   0,
-        "failed":    0,
-        "done":      False,
-        "error":     ""
-    }
-
-    thread = threading.Thread(target=run_scraper, args=(count,))
-    thread.daemon = True
-    thread.start()
-
-    return jsonify({"message": "Job started", "count": count})
-
-
-# ── Endpoint 2: Status ────────────────────────────────────────────────────────
-@app.route("/api/status", methods=["GET"])
-def get_status():
-    return jsonify(job)
+    ctrl.reset()
+    ctrl.update(status="running", phase="collecting")
+    _save_meta(cfg, target, is_all)
+    t = threading.Thread(target=_run_extractor, args=(cfg, target, is_all, False))
+    t.daemon = True
+    ctrl.thread = t
+    t.start()
+    return jsonify({"message": "started"})
 
 
-# ── Endpoint 3: Download ──────────────────────────────────────────────────────
-@app.route("/api/download", methods=["GET"])
-def download():
-    csv_path = "gemarpts_output.csv"
-    if os.path.exists(csv_path):
-        return send_file(
-            csv_path,
-            as_attachment=True,
-            download_name="gem_gemarpts_data.csv"
-        )
-    return jsonify({"error": "CSV not ready yet"}), 404
+@app.route("/api/extract/<mod>/pause", methods=["POST"])
+def ext_pause(mod):
+    cfg = _extractor_or_404(mod)
+    if not cfg:
+        return jsonify({"error": "Unknown module"}), 404
+    cfg["ctrl"].pause_evt.set()
+    return jsonify({"message": "pausing"})
+
+
+@app.route("/api/extract/<mod>/resume", methods=["POST"])
+def ext_resume(mod):
+    cfg = _extractor_or_404(mod)
+    if not cfg:
+        return jsonify({"error": "Unknown module"}), 404
+    ctrl = cfg["ctrl"]
+    if ctrl.is_live():
+        ctrl.pause_evt.clear()                       # same-session: just continue
+        ctrl.update(status="running", paused=False)
+        return jsonify({"message": "resumed"})
+
+    # No live thread (e.g. server was restarted) → resume from the CSV on disk.
+    meta   = _load_meta(cfg)
+    target = meta.get("target")
+    is_all = meta.get("is_all", target is None)
+    ctrl.reset()
+    ctrl.update(status="running", phase="collecting")
+    t = threading.Thread(target=_run_extractor, args=(cfg, target, is_all, True))
+    t.daemon = True
+    ctrl.thread = t
+    t.start()
+    return jsonify({"message": "resumed"})
+
+
+@app.route("/api/extract/<mod>/retry", methods=["POST"])
+def ext_retry(mod):
+    """Manual retry from HOLD — release the held worker to re-attempt from the
+    exact point it stopped. Only acts on a live worker sitting on hold."""
+    cfg = _extractor_or_404(mod)
+    if not cfg:
+        return jsonify({"error": "Unknown module"}), 404
+    ctrl = cfg["ctrl"]
+    if ctrl.is_live():
+        ctrl.retry_evt.set()
+        return jsonify({"message": "retrying"})
+    return jsonify({"message": "no job on hold"}), 409
+
+
+@app.route("/api/extract/<mod>/cancel", methods=["POST"])
+def ext_cancel(mod):
+    cfg = _extractor_or_404(mod)
+    if not cfg:
+        return jsonify({"error": "Unknown module"}), 404
+    ctrl = cfg["ctrl"]
+    ctrl.cancel_evt.set()
+    ctrl.pause_evt.clear()                           # unblock a paused worker so it can exit
+    ctrl.retry_evt.set()                             # unblock a held worker so it can exit
+    if not ctrl.is_live():
+        ctrl.reset()
+    return jsonify({"message": "cancelled"})
+
+
+@app.route("/api/extract/<mod>/status", methods=["GET"])
+def ext_status(mod):
+    cfg = _extractor_or_404(mod)
+    if not cfg:
+        return jsonify({"error": "Unknown module"}), 404
+    return jsonify(cfg["ctrl"].get())
+
+
+@app.route("/api/extract/<mod>/download", methods=["GET"])
+def ext_download(mod):
+    cfg = _extractor_or_404(mod)
+    if not cfg:
+        return jsonify({"error": "Unknown module"}), 404
+    if os.path.exists(cfg["output"]):
+        return send_file(cfg["output"], as_attachment=True, download_name=cfg["dl_name"])
+    return jsonify({"error": "No data yet"}), 404
 
 
 # ── Comparison background worker ──────────────────────────────────────────────
@@ -246,28 +614,45 @@ def _make_progress(my_gen):
 
 
 def run_compare(custom_limit, category_limit, compare_all, my_gen):
+    """
+    Fully LOCAL comparison — no scraping. Custom bids come from the Custom Bid
+    Extractor's output (gemarpts_output.csv); categories come from the static
+    reference CSV. Matches with the 3-layer pipeline and writes the full CSV.
+    """
     global compare_results
     progress = _make_progress(my_gen)
-    try:
-        # ── Phase 1: collect the custom bids FRESH from GeM every run ────────
-        #    (no cache/resume — always reflects what is live right now).
-        session     = build_session()
-        needed      = None if (compare_all or custom_limit is None) else custom_limit
-        custom_rows = collect_custom_bids(session, needed, compare_all, progress)
-        if not custom_rows:
-            raise RuntimeError(
-                "No active custom bids could be collected from GeM right now — "
-                "nothing to compare. Please try again."
-            )
 
-        # ── Phase 2: match the collected custom bids against the categories ──
+    def checkpoint():
+        # pause + cancel(abort). No network here, so no retry/hold state.
+        if my_gen != compare_gen:
+            raise _Aborted()
+        entered = False
+        while compare_pause.is_set() and my_gen == compare_gen:
+            if not entered:
+                with compare_lock:
+                    compare_job.update(status="paused", paused=True)
+                entered = True
+            time.sleep(0.3)
+        if my_gen != compare_gen:
+            raise _Aborted()
+        if entered:
+            with compare_lock:
+                compare_job.update(status="running", paused=False)
+
+    try:
         results = run_matching_job(
-            custom_rows=custom_rows,
+            custom_limit=custom_limit,
             category_limit=category_limit,
             compare_all=compare_all,
             output_csv=COMPARE_CSV,
             progress=progress,
+            checkpoint=checkpoint,
         )
+        if not results:
+            raise RuntimeError(
+                "No extracted custom bids found — run the Custom Bid Extractor "
+                "first, then start the comparison."
+            )
         total = len(results)
         with compare_lock:
             if my_gen != compare_gen:
@@ -313,16 +698,17 @@ def compare():
             return None
 
     custom_limit   = None if compare_all else parse_limit(data.get("customCount"))
-    category_limit = None if compare_all else parse_limit(data.get("categoryCount"))
+    category_limit = None      # always compare against ALL categories in the loaded CSV
 
-    if not compare_all and (custom_limit is None or category_limit is None):
+    if not compare_all and custom_limit is None:
         return jsonify({
-            "error": "Enter a valid number of custom bids and category bids, "
-                     "or turn on Compare All."
+            "error": "Enter a valid number of custom bids, or turn on Compare All."
         }), 400
 
     # Starting a run always supersedes any previous one (bumping the generation
     # aborts a stale/stuck worker), so the user can never get locked out.
+    compare_pause.clear()
+    compare_retry.clear()
     with compare_lock:
         compare_gen += 1
         my_gen = compare_gen
@@ -340,11 +726,37 @@ def compare():
     return jsonify({"message": "Comparison started"})
 
 
+# ── Pause / Resume a comparison ───────────────────────────────────────────────
+@app.route("/api/compare/pause", methods=["POST"])
+def compare_pause_ep():
+    """Pause collection and match-so-far so it can be exported."""
+    compare_pause.set()
+    return jsonify({"message": "pausing"})
+
+
+@app.route("/api/compare/resume", methods=["POST"])
+def compare_resume_ep():
+    compare_pause.clear()
+    with compare_lock:
+        if compare_job.get("status") == "paused":
+            compare_job.update(status="running", paused=False)
+    return jsonify({"message": "resumed"})
+
+
+@app.route("/api/compare/retry", methods=["POST"])
+def compare_retry_ep():
+    """Manually retry a held comparison (network back)."""
+    compare_retry.set()
+    return jsonify({"message": "retrying"})
+
+
 # ── Endpoint: Cancel / reset a comparison ─────────────────────────────────────
 @app.route("/api/compare/cancel", methods=["POST"])
 def compare_cancel():
     """Supersede any running comparison and reset state back to idle."""
     global compare_gen
+    compare_pause.clear()                    # release a paused worker so it aborts
+    compare_retry.clear()
     with compare_lock:
         compare_gen += 1                     # abort whatever worker is running
         compare_job.clear()
@@ -357,6 +769,18 @@ def compare_cancel():
 def compare_status():
     with compare_lock:
         return jsonify(dict(compare_job))
+
+
+# ── How many custom bids are available to compare (extractor output size) ─────
+@app.route("/api/compare/available", methods=["GET"])
+def compare_available():
+    n = 0
+    if os.path.exists(CUSTOM_OUTPUT_CSV):
+        with open(CUSTOM_OUTPUT_CSV, newline="", encoding="utf-8") as f:
+            for r in _csv.reader(f):
+                if r and r[0] and r[0] != "Bid No":
+                    n += 1
+    return jsonify({"available": n})
 
 
 # ── Endpoint 6: Compare result (rows, once done) ──────────────────────────────
