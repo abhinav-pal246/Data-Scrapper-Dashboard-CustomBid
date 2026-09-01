@@ -1,18 +1,356 @@
 import { useState, useEffect, useRef } from "react";
 
-const API = "http://127.0.0.1:5000";
+const API = ""; // same-origin; Vite proxies /api -> Flask (see vite.config.js)
 
 const CONFIDENT = ["Strong match", "Likely match", "Possible match"];
 const isConfident = (row) => CONFIDENT.includes(row["Match Label"]);
 
-// Colour-code by the match strength label.
 function verdictStyle(row) {
   const label = row["Match Label"] || "";
-  if (label === "Strong match")   return "bg-emerald-950 text-emerald-300 border-emerald-700";
-  if (label === "Likely match")   return "bg-blue-950 text-blue-300 border-blue-700";
-  if (label === "Possible match") return "bg-purple-950 text-purple-300 border-purple-700";
-  if (label.startsWith("Weak"))   return "bg-amber-950 text-amber-300 border-amber-700";
-  return "bg-gray-800 text-gray-400 border-gray-700";
+  if (label === "Strong match")   return "text-gem-green bg-green-50 border-green-300";
+  if (label === "Likely match")   return "text-gem-blue bg-blue-50 border-blue-200";
+  if (label === "Possible match") return "text-purple-700 bg-purple-50 border-purple-200";
+  if (label.startsWith("Weak"))   return "text-amber-700 bg-amber-50 border-amber-300";
+  return "text-gem-muted bg-slate-100 border-gem-border";
+}
+
+// ── Department insights ───────────────────────────────────────────────────────
+// A Custom Bid is treated as "avoidable" when it matches an existing Category
+// Bid at or above this score, i.e. a suitable Category Bid was already available.
+const MATCH_THRESHOLD = 70;
+
+function analyze(rows) {
+  const total = rows.length;
+  const deptCounts = {};   // department -> number of avoidable Custom Bids
+  const avoidable  = [];   // one entry per Custom Bid that meets the threshold
+
+  for (const r of rows) {
+    const score = parseFloat(r["Match Score"]);          // reads "76%" and "91.0 / 100"
+    const category = r["Matched Category"];
+    if (isNaN(score) || score < MATCH_THRESHOLD || !category || category === "—") continue;
+    const dept = (r["Department"] || "").trim() || "Unspecified department";
+    deptCounts[dept] = (deptCounts[dept] || 0) + 1;
+    avoidable.push({
+      bidNo: r["Bid No"] || "—",
+      dept,
+      item: r["Item Category"] || "—",
+      category,
+      score: Math.round(score),
+    });
+  }
+
+  const byDept = Object.entries(deptCounts)
+    .map(([dept, count]) => ({ dept, count }))
+    .sort((a, b) => b.count - a.count);
+
+  // Details ordered by match score, highest first.
+  avoidable.sort((a, b) => (b.score - a.score) || a.dept.localeCompare(b.dept));
+
+  return { total, avoidableCount: avoidable.length, deptCount: byDept.length, byDept, avoidable };
+}
+
+// ── Supporting analyses ───────────────────────────────────────────────────────
+const _normText = (s) => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+// Significant word tokens: drop short words and standalone numbers so that bids
+// differing only in numeric spec values are still recognised as similar wording.
+const _wordTokens = (s) => _normText(s).split(" ").filter((w) => w.length > 2 && !/^\d+$/.test(w));
+
+// Category Activity: categories that repeatedly attract Custom Bids.
+function categoryActivity(rows) {
+  const cats = {};
+  for (const r of rows) {
+    const c = r["Matched Category"];
+    if (!c || c === "—") continue;
+    if (!cats[c]) cats[c] = { count: 0, depts: new Set() };
+    cats[c].count++;
+    const d = (r["Department"] || "").trim();
+    if (d) cats[c].depts.add(d);
+  }
+  return Object.entries(cats)
+    .map(([category, v]) => ({ category, count: v.count, depts: v.depts.size }))
+    .filter((x) => x.count >= 2)
+    .sort((a, b) => b.count - a.count);
+}
+
+// Similarity: Custom Bids whose requirement wording is essentially the same.
+function similarityGroups(rows) {
+  const sig = {};
+  for (const r of rows) {
+    const t = [...new Set(_wordTokens(r["Item Category"]))].sort();
+    if (t.length < 2) continue;
+    const key = t.join(" ");
+    (sig[key] = sig[key] || []).push({
+      bidNo: r["Bid No"] || "—",
+      item: r["Item Category"] || "—",
+      dept: (r["Department"] || "").trim() || "Unspecified department",
+    });
+  }
+  return Object.values(sig).filter((g) => g.length >= 2).sort((a, b) => b.length - a.length);
+}
+
+// Specification: Custom Bids with unusually specific, uncommon or irregular detail.
+function specificationFlags(rows) {
+  const UNIT = /\b(mm|cm|mtr|metre|meter|kg|gm|gram|ltr|litre|liter|volt|kv|kva|watt|kw|hz|khz|mhz|ghz|mbps|gbps|amp|ampere|inch|ton|tonne|psi|bar|rpm|micron|ppm|nm)\b/i;
+  const CODE  = /\b(is|iec|astm|bis|din|mil|jss|iso|en)\s?[:\-]?\s?\d/i;
+  const MODEL = /\b[a-z]{2,}[-/ ]?\d{2,}\b/i;
+  const out = [];
+  for (const r of rows) {
+    const item = r["Item Category"] || "";
+    const numTokens = (item.match(/\b\d[\d.,/x×-]*\b/gi) || []).length;
+
+    // Genuine specificity signals — a bid is flagged only when it shows one.
+    const signals = [];
+    if (numTokens >= 4 || (UNIT.test(item) && numTokens >= 2)) signals.push("Detailed measurements or units");
+    if (CODE.test(item)) signals.push("Cites a standard or specification code");
+    else if (MODEL.test(item)) signals.push("Contains a model or part code");
+    if (item.length > 160) signals.push("Very long specification");
+    if (signals.length === 0) continue;
+
+    // Supporting context (does not flag on its own).
+    const reasons = [...signals];
+    const score = parseFloat(r["Match Score"]);
+    if (!isNaN(score) && score < 70) reasons.push("No close standard category");
+
+    out.push({
+      bidNo: r["Bid No"] || "—",
+      item,
+      dept: (r["Department"] || "").trim() || "Unspecified department",
+      reasons,
+      weight: signals.length * 10 + numTokens + (item.length > 160 ? 5 : 0),
+    });
+  }
+  return out.sort((a, b) => b.weight - a.weight);
+}
+
+function ResultsVisualizer({ rows }) {
+  const { total, avoidableCount, deptCount, byDept, avoidable } = analyze(rows);
+  const maxDept = byDept.length ? byDept[0].count : 1;
+  const pct = total ? Math.round((avoidableCount / total) * 100) : 0;
+
+  return (
+    <div className="space-y-4">
+      {/* Summary */}
+      <div className="gem-card gem-card-pad">
+        <h3 className="text-base font-semibold text-gem-text">Custom Bids with an available Category Bid</h3>
+        <p className="text-sm text-gem-muted mt-1 leading-relaxed">
+          The figures below count Custom Bids that matched an existing Category Bid at {MATCH_THRESHOLD}% or above.
+          Each of these could have been placed as a standard Category Bid.
+        </p>
+        <div className="flex flex-wrap gap-x-12 gap-y-4 mt-4">
+          <div>
+            <p className="text-3xl font-bold text-gem-text tabular-nums">{avoidableCount.toLocaleString()}</p>
+            <p className="text-xs text-gem-muted">of {total.toLocaleString()} Custom Bids ({pct}%)</p>
+          </div>
+          <div>
+            <p className="text-3xl font-bold text-gem-text tabular-nums">{deptCount.toLocaleString()}</p>
+            <p className="text-xs text-gem-muted">{deptCount === 1 ? "department involved" : "departments involved"}</p>
+          </div>
+        </div>
+      </div>
+
+      {avoidableCount === 0 ? (
+        <div className="gem-card gem-card-pad">
+          <p className="text-sm text-gem-text">
+            No Custom Bids matched an existing Category Bid at {MATCH_THRESHOLD}% or above.
+            No avoidable Custom Bids were identified in this comparison.
+          </p>
+        </div>
+      ) : (
+        <>
+          {/* Department-wise usage */}
+          <div className="gem-card overflow-hidden">
+            <div className="gem-card-pad pb-3">
+              <h3 className="text-base font-semibold text-gem-text">Department-wise usage</h3>
+              <p className="text-sm text-gem-muted mt-1">
+                How many times each department raised a Custom Bid while a matching Category Bid was available.
+              </p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="gem-table">
+                <thead>
+                  <tr>
+                    <th>Department</th>
+                    <th className="text-right whitespace-nowrap">Avoidable Custom Bids</th>
+                    <th className="w-2/5">Relative share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {byDept.map(({ dept, count }) => (
+                    <tr key={dept}>
+                      <td className="text-gem-text">{dept}</td>
+                      <td className="text-right font-semibold text-gem-text tabular-nums">{count.toLocaleString()}</td>
+                      <td>
+                        <div className="bg-slate-100 rounded h-2.5 overflow-hidden">
+                          <div className="bg-gem-blue h-2.5" style={{ width: `${Math.round((count / maxDept) * 100)}%` }} />
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Matching details */}
+          <div className="gem-card overflow-hidden">
+            <div className="gem-card-pad pb-3">
+              <h3 className="text-base font-semibold text-gem-text">Matching Category Bids</h3>
+              <p className="text-sm text-gem-muted mt-1">
+                Each Custom Bid above, with the existing Category Bid it could have used.
+              </p>
+            </div>
+            <div className="overflow-auto max-h-[60vh]">
+              <table className="gem-table">
+                <thead className="sticky top-0 z-10">
+                  <tr>
+                    <th>Department</th><th>Custom Bid No</th><th>Custom Item</th>
+                    <th>Matching Category</th><th className="text-right">Match</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {avoidable.map((a, i) => (
+                    <tr key={i}>
+                      <td className="text-gem-text text-xs">{a.dept}</td>
+                      <td className="font-mono text-xs text-gem-blue whitespace-nowrap">{a.bidNo}</td>
+                      <td className="text-gem-text max-w-xs">{a.item}</td>
+                      <td className="text-gem-text max-w-xs">{a.category}</td>
+                      <td className="text-right font-semibold text-gem-green tabular-nums">{a.score}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Analysis view (separate tab): category activity, similarity, specifications ─
+function AnalysisView({ rows }) {
+  const catActivity = categoryActivity(rows);
+  const simGroups   = similarityGroups(rows);
+  const specFlags   = specificationFlags(rows);
+  const maxCat      = catActivity.length ? catActivity[0].count : 1;
+
+  return (
+    <div className="space-y-4">
+      {/* Category Activity Analysis */}
+      <div className="gem-card overflow-hidden">
+        <div className="gem-card-pad pb-3">
+          <h3 className="text-base font-semibold text-gem-text">Category Activity Analysis</h3>
+          <p className="text-sm text-gem-muted mt-1">Which categories show unusually high custom-bid activity.</p>
+        </div>
+        {catActivity.length ? (
+          <div className="overflow-x-auto">
+            <table className="gem-table">
+              <thead>
+                <tr>
+                  <th>Category</th>
+                  <th className="text-right whitespace-nowrap">Custom Bids</th>
+                  <th className="text-right">Departments</th>
+                  <th className="w-1/4">Activity</th>
+                </tr>
+              </thead>
+              <tbody>
+                {catActivity.slice(0, 15).map((c) => (
+                  <tr key={c.category}>
+                    <td className="text-gem-text">{c.category}</td>
+                    <td className="text-right font-semibold text-gem-text tabular-nums">{c.count}</td>
+                    <td className="text-right text-gem-text tabular-nums">{c.depts}</td>
+                    <td>
+                      <div className="bg-slate-100 rounded h-2.5 overflow-hidden">
+                        <div className="bg-gem-blue h-2.5" style={{ width: `${Math.round((c.count / maxCat) * 100)}%` }} />
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="gem-card-pad pt-0 text-sm text-gem-text">
+            No category attracted more than one Custom Bid. No unusual concentration of activity was found.
+          </p>
+        )}
+      </div>
+
+      {/* Similarity Analysis */}
+      <div className="gem-card">
+        <div className="gem-card-pad pb-3">
+          <h3 className="text-base font-semibold text-gem-text">Similarity Analysis</h3>
+          <p className="text-sm text-gem-muted mt-1">
+            Custom bids that share highly similar or nearly identical requirements.
+          </p>
+        </div>
+        {simGroups.length ? (
+          <div className="gem-card-pad pt-0 space-y-3">
+            <p className="text-sm text-gem-text">
+              {simGroups.length} {simGroups.length === 1 ? "set" : "sets"} of similar Custom Bids identified.
+            </p>
+            {simGroups.slice(0, 10).map((g, i) => (
+              <div key={i} className="border border-gem-border rounded-md p-3">
+                <p className="text-xs font-semibold text-gem-text mb-2">{g.length} bids with matching requirements</p>
+                <div className="space-y-1">
+                  {g.map((b, j) => (
+                    <div key={j} className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-xs">
+                      <span className="font-mono text-gem-blue">{b.bidNo}</span>
+                      <span className="text-gem-text">{b.item}</span>
+                      <span className="text-gem-muted">{b.dept}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="gem-card-pad pt-0 text-sm text-gem-text">
+            No Custom Bids with matching requirement wording were found.
+          </p>
+        )}
+      </div>
+
+      {/* Specification Analysis */}
+      <div className="gem-card overflow-hidden">
+        <div className="gem-card-pad pb-3">
+          <h3 className="text-base font-semibold text-gem-text">Specification Analysis</h3>
+          <p className="text-sm text-gem-muted mt-1">
+            Custom bids that contain unusually specific, uncommon, or irregular specifications.
+          </p>
+        </div>
+        {specFlags.length ? (
+          <div className="overflow-auto max-h-[60vh]">
+            <table className="gem-table">
+              <thead className="sticky top-0 z-10">
+                <tr><th>Custom Bid No</th><th>Department</th><th>Custom Item</th><th>Observation</th></tr>
+              </thead>
+              <tbody>
+                {specFlags.slice(0, 25).map((f, i) => (
+                  <tr key={i}>
+                    <td className="font-mono text-xs text-gem-blue whitespace-nowrap">{f.bidNo}</td>
+                    <td className="text-gem-text text-xs">{f.dept}</td>
+                    <td className="text-gem-text max-w-xs">{f.item}</td>
+                    <td>
+                      <div className="flex flex-wrap gap-1">
+                        {f.reasons.map((rs, k) => (
+                          <span key={k} className="gem-badge bg-amber-50 text-amber-700 border-amber-300 font-normal">{rs}</span>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="gem-card-pad pt-0 text-sm text-gem-text">
+            No Custom Bids showed unusually specific or irregular specifications.
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export default function ComparisonDashboard() {
@@ -20,74 +358,56 @@ export default function ComparisonDashboard() {
   const [compareAll, setCompareAll]   = useState(false);
 
   const [status, setStatus] = useState("idle"); // idle | running | done | error
-  const [phase, setPhase]   = useState("extract"); // extract | compare (while running)
-  const [extractJob, setExtractJob] = useState(null); // fresh-extraction progress
-  const [job, setJob]       = useState(null);   // comparison progress
+  const [phase, setPhase]   = useState("extract"); // extract | compare
+  const [extractJob, setExtractJob] = useState(null);
+  const [job, setJob]       = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError]   = useState("");
+  const [resultView, setResultView] = useState("list"); // list | analytics
 
   const pollRef        = useRef(null);
-  const phaseRef       = useRef("extract");     // synchronous phase for the poller
+  const phaseRef       = useRef("extract");
   const compareStarted = useRef(false);
 
-  // ── Poll the active phase while running ────────────────────────────────────
   useEffect(() => {
     if (status !== "running") return;
-
     pollRef.current = setInterval(async () => {
       try {
-        // ── Phase 1: fresh Custom Bid extraction ──
         if (phaseRef.current === "extract") {
           const data = await (await fetch(`${API}/api/extract/custom/status`)).json();
           setExtractJob(data);
           if (data.done) {
             if (data.status === "error") {
               setError(data.error || "Custom Bid extraction failed.");
-              setStatus("error");
-              clearInterval(pollRef.current);
-              return;
+              setStatus("error"); clearInterval(pollRef.current); return;
             }
-            // Extraction finished → kick off the comparison over the fresh data.
             if (!compareStarted.current) {
               compareStarted.current = true;
-              phaseRef.current = "compare";
-              setPhase("compare");
+              phaseRef.current = "compare"; setPhase("compare");
               setJob({ phase: "Starting", total: 0, processed: 0, encoded: 0, encode_total: 0 });
               const res = await fetch(`${API}/api/compare`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ compareAll: true }), // compare all freshly-extracted
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ compareAll: true }),
               });
               if (!res.ok) {
                 const d = await res.json().catch(() => ({}));
                 setError(d.error || "Could not start comparison.");
-                setStatus("error");
-                clearInterval(pollRef.current);
+                setStatus("error"); clearInterval(pollRef.current);
               }
             }
           }
           return;
         }
-
-        // ── Phase 2: comparison ──
         const data = await (await fetch(`${API}/api/compare/status`)).json();
         setJob(data);
         if (data.done) {
           clearInterval(pollRef.current);
-          if (data.status === "error") {
-            setError(data.error || "Comparison failed.");
-            setStatus("error");
-            return;
-          }
+          if (data.status === "error") { setError(data.error || "Comparison failed."); setStatus("error"); return; }
           const r = await fetch(`${API}/api/compare/result`);
-          setResult(await r.json());
-          setStatus("done");
+          setResult(await r.json()); setStatus("done");
         }
-      } catch (err) {
-        console.error("poll error:", err);
-      }
+      } catch (err) { console.error("poll error:", err); }
     }, 800);
-
     return () => clearInterval(pollRef.current);
   }, [status]);
 
@@ -95,67 +415,64 @@ export default function ComparisonDashboard() {
     if (!compareAll) {
       const c = Number(customCount);
       if (!customCount || isNaN(c) || c <= 0) {
-        alert("Enter a valid number of custom bids to extract, or turn on Compare All.");
-        return;
+        alert("Please enter a valid number of custom bids, or select the option to compare all active custom bids."); return;
       }
     }
-    setError("");
-    setResult(null);
-    setJob(null);
+    setError(""); setResult(null); setJob(null);
     setExtractJob({ phase: "collecting", written: 0, total: 0, collected: 0, failed: 0 });
-    compareStarted.current = false;
-    phaseRef.current = "extract";
-    setPhase("extract");
-    setStatus("running");
-
+    compareStarted.current = false; phaseRef.current = "extract"; setPhase("extract"); setStatus("running");
     try {
-      // Phase 1: always start a FRESH custom-bid extraction first.
       const res = await fetch(`${API}/api/extract/custom/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ count: compareAll ? "all" : Number(customCount) }),
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
-        setError(d.error || "Could not start the fresh custom-bid extraction "
-                 + "(one may already be running in the Custom Bid Extractor tab).");
+        setError(d.error || "The fresh custom bid extraction could not be started. "
+                 + "An extraction may already be running in the Custom Bid Extractor tab.");
         setStatus("error");
       }
-    } catch (err) {
-      setError(String(err));
-      setStatus("error");
-    }
+    } catch (err) { setError(String(err)); setStatus("error"); }
   };
 
-  // Controls act on whichever phase is currently active.
   const activeBase = () => (phaseRef.current === "extract" ? `${API}/api/extract/custom` : `${API}/api/compare`);
   const handlePause  = () => fetch(`${activeBase()}/pause`,  { method: "POST" });
   const handleResume = () => fetch(`${activeBase()}/resume`, { method: "POST" });
   const handleRetry  = () => fetch(`${activeBase()}/retry`,  { method: "POST" });
   const handleExportActive = () => window.open(`${activeBase()}/download`, "_blank");
-
   const handleCancel = async () => {
     clearInterval(pollRef.current);
-    try {
-      await fetch(`${activeBase()}/cancel`, { method: "POST" });
-    } catch (err) { console.error("cancel error:", err); }
+    try { await fetch(`${activeBase()}/cancel`, { method: "POST" }); } catch (e) { console.error(e); }
     reset();
   };
-
   const handleDownload = () => window.open(`${API}/api/compare/download`, "_blank");
+
+  // While extraction is paused/on-hold: stop collecting more and compare the
+  // custom bids gathered so far, then show all results.
+  const handleCompareSoFar = async () => {
+    try { await fetch(`${API}/api/extract/custom/cancel`, { method: "POST" }); } catch (e) { console.error(e); }
+    compareStarted.current = true;
+    phaseRef.current = "compare"; setPhase("compare");
+    setExtractJob((p) => ({ ...(p || {}), status: "done", done: true }));
+    setJob({ phase: "Starting", total: 0, processed: 0, encoded: 0, encode_total: 0 });
+    const res = await fetch(`${API}/api/compare`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ compareAll: true }),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      setError(d.error || "Could not start comparison."); setStatus("error");
+    }
+  };
 
   const reset = () => {
     setStatus("idle"); setPhase("extract"); phaseRef.current = "extract";
-    compareStarted.current = false;
-    setExtractJob(null); setJob(null); setResult(null); setError("");
+    compareStarted.current = false; setExtractJob(null); setJob(null); setResult(null); setError("");
   };
 
   const confidentCount = result?.rows ? result.rows.filter(isConfident).length : null;
-  const weakCount = result?.rows
-    ? result.rows.filter((r) => !isConfident(r) && r["Matched Category"] !== "—").length
-    : null;
+  const weakCount = result?.rows ? result.rows.filter((r) => !isConfident(r) && r["Matched Category"] !== "—").length : null;
 
-  // Active-phase job + derived progress.
   const aj = phase === "extract" ? extractJob : job;
   const ajStatus = aj?.status;
   const extractPct = extractJob?.total > 0 ? Math.round((extractJob.written / extractJob.total) * 100) : 0;
@@ -164,253 +481,238 @@ export default function ComparisonDashboard() {
   const isEncoding = job?.phase?.startsWith("Encoding");
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white flex items-start justify-center p-6">
-      <div className="w-full max-w-6xl space-y-6">
+    <div className="gem-wrap max-w-6xl py-8 space-y-6">
 
-        {/* Header */}
+      <div>
+        <h1 className="gem-title">Custom Bid to Category Comparison</h1>
+        <p className="gem-sub">
+          Each run first performs a fresh Custom Bid extraction, then matches the newly extracted bids against the
+          fixed category reference list. This ensures every comparison reflects the latest data. All matching is
+          performed locally and remains fully explainable.
+        </p>
+      </div>
+
+      {/* Controls */}
+      <div className="gem-card gem-card-accent gem-card-pad space-y-5">
         <div>
-          <h1 className="text-2xl font-bold text-white">Custom Bid → Category Comparison</h1>
-          <p className="text-gray-400 text-sm mt-1">
-            Runs a <span className="text-gray-200">fresh Custom Bid extraction</span> first, then matches
-            those newly extracted bids against your fixed category reference CSV — so every run uses the
-            latest data. Local, explainable, three-layer matching (fuzzy → TF-IDF → embeddings).
+          <label className="gem-label">Number of Custom Bids to extract and compare</label>
+          <input type="number" value={customCount} onChange={(e) => setCustomCount(e.target.value)}
+                 disabled={compareAll || status === "running"} placeholder="For example, 50" className="gem-input" />
+          <p className="gem-help mt-1.5">
+            A fresh extraction runs first for this number of active custom bids, after which each bid is
+            matched against the full category reference list.
           </p>
         </div>
 
-        {/* Controls */}
-        <div className="bg-gray-900 rounded-2xl shadow-2xl p-6 space-y-5">
-          <div className="space-y-2">
-            <label className="text-sm text-gray-300"># of Custom Bids to extract &amp; compare</label>
-            <input
-              type="number"
-              value={customCount}
-              onChange={(e) => setCustomCount(e.target.value)}
-              disabled={compareAll || status === "running"}
-              placeholder="e.g. 50"
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3
-                         text-white placeholder-gray-500 focus:outline-none
-                         focus:border-blue-500 disabled:opacity-40"
-            />
-            <p className="text-xs text-gray-500">
-              A fresh extraction runs first (this many active custom bids, live from GeM ~1.5s each),
-              then they're matched against the full category reference list.
+        <label className="flex items-center gap-3 cursor-pointer">
+          <input type="checkbox" checked={compareAll} onChange={(e) => setCompareAll(e.target.checked)}
+                 disabled={status === "running"} className="w-4 h-4 accent-gem-blue" />
+          <span className="text-sm text-gem-text">
+            Extract and compare <span className="font-semibold">all</span> active custom bids.
+            This ignores the number above and may take some time.
+          </span>
+        </label>
+
+        <button onClick={handleRun} disabled={status === "running"} className="gem-btn gem-btn-primary w-full py-3">
+          {status === "running" ? (phase === "extract" ? "Extracting custom bids" : "Matching") : "Extract and Run Comparison"}
+        </button>
+
+        <div className="flex flex-wrap gap-4 text-xs text-gem-muted pt-1 border-t border-gem-border">
+          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-gem-green" /> Strong (fuzzy above 90)</span>
+          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-gem-blue" /> Likely (TF-IDF above 0.65)</span>
+          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-purple-500" /> Possible (embedding above 0.75)</span>
+          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" /> Weak (review)</span>
+        </div>
+      </div>
+
+      {/* Running — two-phase */}
+      {status === "running" && (
+        <div className="gem-card gem-card-pad space-y-4">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className={`px-2.5 py-1 rounded ${phase === "extract" ? "bg-blue-100 text-gem-blue" : "bg-green-50 text-gem-green"}`}>
+              Step 1. {phase === "extract" ? "Custom Bid extraction" : "Custom Bid extraction complete"}
+            </span>
+            <span className={`px-2.5 py-1 rounded ${phase === "compare" ? "bg-blue-100 text-gem-blue" : "bg-slate-100 text-gem-muted"}`}>
+              Step 2. Category matching
+            </span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {ajStatus === "paused"   ? <div className="text-amber-500 text-lg leading-none">⏸</div>
+             : ajStatus === "hold"    ? <div className="text-gem-red text-lg leading-none">⏸</div>
+             : ajStatus === "retrying"? <div className="w-4 h-4 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+             : <div className="w-4 h-4 border-2 border-gem-blue border-t-transparent rounded-full animate-spin" />}
+            <p className="text-sm font-semibold text-gem-text">
+              {ajStatus === "paused"   ? "Paused. Progress saved. You can export the data or resume."
+               : ajStatus === "hold"    ? `On hold. Unable to reach GeM after ${aj?.max_attempts} attempts. Progress saved.`
+               : ajStatus === "retrying"? `Network issue detected. Retrying automatically (attempt ${aj?.attempt} of ${aj?.max_attempts}).`
+               : phase === "extract"    ? "Extracting custom bids from GeM."
+               : (job?.phase || "Matching")}
             </p>
           </div>
 
-          <label className="flex items-center gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={compareAll}
-              onChange={(e) => setCompareAll(e.target.checked)}
-              disabled={status === "running"}
-              className="w-4 h-4 accent-blue-500"
-            />
-            <span className="text-sm text-gray-300">
-              Extract &amp; compare <span className="font-semibold text-white">ALL</span> active custom bids
-              (ignores the number above — can take a while)
-            </span>
-          </label>
+          {phase === "extract" && extractJob && (
+            <div>
+              <div className="w-full bg-slate-200 rounded-full h-2.5 overflow-hidden">
+                <div className="bg-gem-blue h-2.5 rounded-full transition-all duration-300" style={{ width: `${extractPct}%` }} />
+              </div>
+              <div className="flex justify-between text-xs mt-2 text-gem-muted">
+                <span>{extractJob.written} extracted{extractJob.total ? ` of ${extractJob.total}` : ""}{extractJob.failed > 0 && ` · ${extractJob.failed} skipped`}</span>
+                <span className="text-gem-blue">{extractJob.total ? `${extractPct}%` : `${extractJob.collected} scanned`}</span>
+              </div>
+            </div>
+          )}
+          {phase === "compare" && job?.total > 0 && !isEncoding && (
+            <div>
+              <div className="w-full bg-slate-200 rounded-full h-2.5 overflow-hidden">
+                <div className="bg-gem-blue h-2.5 rounded-full transition-all duration-300" style={{ width: `${itemPct}%` }} />
+              </div>
+              <div className="flex justify-between text-xs mt-2 text-gem-muted">
+                <span>{job.processed?.toLocaleString()} / {job.total?.toLocaleString()} custom bids</span>
+                <span className="text-gem-blue">{itemPct}%</span>
+              </div>
+            </div>
+          )}
+          {phase === "compare" && isEncoding && job?.encode_total > 0 && (
+            <div>
+              <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
+                <div className="bg-purple-500 h-2 rounded-full transition-all duration-300" style={{ width: `${encodePct}%` }} />
+              </div>
+              <div className="flex justify-between text-xs mt-2 text-gem-muted">
+                <span>{job.phase} · {job.encoded?.toLocaleString()} / {job.encode_total?.toLocaleString()}</span>
+                <span className="text-purple-600">{encodePct}%</span>
+              </div>
+            </div>
+          )}
 
-          <button
-            onClick={handleRun}
-            disabled={status === "running"}
-            className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50
-                       text-white font-semibold py-3 rounded-lg transition-colors"
-          >
-            {status === "running"
-              ? (phase === "extract" ? "Extracting fresh custom bids…" : "Matching…")
-              : "Extract fresh & Run Comparison"}
-          </button>
-
-          {/* Layer legend */}
-          <div className="flex flex-wrap gap-3 text-xs text-gray-400 pt-1">
-            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /> Strong (fuzzy &gt; 90)</span>
-            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-blue-500" /> Likely (TF-IDF &gt; 0.65)</span>
-            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-purple-500" /> Possible (embed &gt; 0.75)</span>
-            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" /> Weak — review</span>
+          <div className="flex justify-center gap-3">
+            {ajStatus === "paused" && (
+              <>
+                <button onClick={handleResume} className="gem-btn gem-btn-success">Resume</button>
+                <button onClick={handleExportActive} className="gem-btn gem-btn-ghost">Export collected data</button>
+              </>
+            )}
+            {ajStatus === "hold" && (
+              <>
+                <button onClick={handleRetry} className="gem-btn gem-btn-success">Retry</button>
+                <button onClick={handleExportActive} className="gem-btn gem-btn-ghost">Export collected data</button>
+              </>
+            )}
+            {phase === "extract" && (ajStatus === "paused" || ajStatus === "hold") && extractJob?.written > 0 && (
+              <button onClick={handleCompareSoFar} className="gem-btn gem-btn-primary">
+                Compare {extractJob.written} collected bids
+              </button>
+            )}
+            {(!ajStatus || ajStatus === "running" || ajStatus === "retrying") && (
+              <button onClick={handlePause} className="gem-btn gem-btn-warn">Pause</button>
+            )}
+            <button onClick={handleCancel} className="gem-btn gem-btn-danger">Cancel</button>
           </div>
         </div>
+      )}
 
-        {/* Running — two-phase progress */}
-        {status === "running" && (
-          <div className="bg-gray-900 rounded-2xl p-6 space-y-4">
-            {/* Step indicator */}
-            <div className="flex items-center gap-2 text-xs">
-              <span className={`px-2 py-1 rounded ${phase === "extract" ? "bg-blue-900 text-blue-200" : "bg-gray-800 text-green-400"}`}>
-                {phase === "extract" ? "①" : "✓"} Fresh Custom Bid extraction
-              </span>
-              <span className="text-gray-600">→</span>
-              <span className={`px-2 py-1 rounded ${phase === "compare" ? "bg-blue-900 text-blue-200" : "bg-gray-800 text-gray-500"}`}>
-                ② Match against categories
-              </span>
-            </div>
+      {/* Error */}
+      {status === "error" && (
+        <div className="gem-card gem-card-pad text-center space-y-3">
+          <div className="mx-auto w-12 h-12 rounded-full bg-red-100 text-gem-red flex items-center justify-center text-2xl">!</div>
+          <p className="text-gem-red font-semibold">The comparison could not be completed</p>
+          <p className="text-gem-muted text-xs break-all">{error}</p>
+          <button onClick={reset} className="gem-btn gem-btn-ghost">Try again</button>
+        </div>
+      )}
 
-            {/* Status line + banners */}
-            <div className="flex items-center gap-3">
-              {ajStatus === "paused"   ? <div className="text-amber-400 text-lg leading-none">⏸</div>
-               : ajStatus === "hold"    ? <div className="text-red-400 text-lg leading-none">⏸</div>
-               : ajStatus === "retrying"? <div className="w-4 h-4 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin" />
-               : <div className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />}
-              <p className="text-sm font-semibold text-white">
-                {ajStatus === "paused"   ? "Paused — progress saved (export or resume)"
-                 : ajStatus === "hold"    ? `On hold — couldn't reach GeM after ${aj?.max_attempts} tries. Progress saved.`
-                 : ajStatus === "retrying"? `Network issue — auto-retrying (attempt ${aj?.attempt}/${aj?.max_attempts})…`
-                 : phase === "extract"    ? "Extracting fresh custom bids from GeM…"
-                 : (job?.phase || "Matching…")}
-              </p>
-            </div>
-
-            {/* Phase 1 progress: extraction */}
-            {phase === "extract" && extractJob && (
+      {/* Done */}
+      {status === "done" && result && (
+        <div className="space-y-4">
+          <div className="gem-card gem-card-pad flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-wrap gap-8">
               <div>
-                <div className="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
-                  <div className="bg-blue-500 h-3 rounded-full transition-all duration-300" style={{ width: `${extractPct}%` }} />
-                </div>
-                <div className="flex justify-between text-xs mt-2 text-gray-400">
-                  <span>
-                    {extractJob.written} extracted{extractJob.total ? ` of ${extractJob.total}` : ""}
-                    {extractJob.failed > 0 && ` · ${extractJob.failed} skipped`}
-                  </span>
-                  <span className="text-blue-400">{extractJob.total ? `${extractPct}%` : `${extractJob.collected} scanned`}</span>
-                </div>
+                <p className="text-2xl font-bold text-gem-text">{result.total.toLocaleString()}</p>
+                <p className="text-xs text-gem-muted">Custom bids compared</p>
               </div>
-            )}
-
-            {/* Phase 2 progress: matching */}
-            {phase === "compare" && job?.total > 0 && !isEncoding && (
-              <div>
-                <div className="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
-                  <div className="bg-blue-500 h-3 rounded-full transition-all duration-300" style={{ width: `${itemPct}%` }} />
-                </div>
-                <div className="flex justify-between text-xs mt-2 text-gray-400">
-                  <span>{job.processed?.toLocaleString()} / {job.total?.toLocaleString()} custom bids</span>
-                  <span className="text-blue-400">{itemPct}%</span>
-                </div>
-              </div>
-            )}
-            {phase === "compare" && isEncoding && job?.encode_total > 0 && (
-              <div>
-                <div className="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
-                  <div className="bg-purple-500 h-2 rounded-full transition-all duration-300" style={{ width: `${encodePct}%` }} />
-                </div>
-                <div className="flex justify-between text-xs mt-2 text-gray-400">
-                  <span>{job.phase} · {job.encoded?.toLocaleString()} / {job.encode_total?.toLocaleString()}</span>
-                  <span className="text-purple-400">{encodePct}%</span>
-                </div>
-              </div>
-            )}
-
-            {/* Controls (act on the active phase) */}
-            <div className="flex justify-center gap-3">
-              {ajStatus === "paused" && (
-                <>
-                  <button onClick={handleResume} className="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg text-sm">Resume</button>
-                  <button onClick={handleExportActive} className="bg-gray-700 hover:bg-gray-600 text-white px-5 py-2 rounded-lg text-sm">Export so far</button>
-                </>
-              )}
-              {ajStatus === "hold" && (
-                <>
-                  <button onClick={handleRetry} className="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2 rounded-lg text-sm">Retry now</button>
-                  <button onClick={handleExportActive} className="bg-gray-700 hover:bg-gray-600 text-white px-5 py-2 rounded-lg text-sm">Extract so far</button>
-                </>
-              )}
-              {(!ajStatus || ajStatus === "running" || ajStatus === "retrying") && (
-                <button onClick={handlePause} className="bg-amber-600 hover:bg-amber-500 text-white font-semibold px-5 py-2 rounded-lg text-sm">Pause</button>
-              )}
-              <button onClick={handleCancel} className="bg-red-900 hover:bg-red-800 text-red-200 px-5 py-2 rounded-lg text-sm">Cancel</button>
-            </div>
-          </div>
-        )}
-
-        {/* Error */}
-        {status === "error" && (
-          <div className="bg-gray-900 rounded-2xl p-6 text-center space-y-3">
-            <div className="text-red-400 text-3xl">✗</div>
-            <p className="text-red-400 font-semibold">Run failed</p>
-            <p className="text-gray-500 text-xs break-all">{error}</p>
-            <button onClick={reset} className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg text-sm">Try again</button>
-          </div>
-        )}
-
-        {/* Done */}
-        {status === "done" && result && (
-          <div className="space-y-4">
-            <div className="bg-gray-900 rounded-2xl p-5 flex flex-wrap items-center justify-between gap-4">
-              <div className="flex flex-wrap gap-6">
+              {confidentCount !== null && (
                 <div>
-                  <p className="text-2xl font-bold text-white">{result.total.toLocaleString()}</p>
-                  <p className="text-xs text-gray-400">Custom bids compared</p>
+                  <p className="text-2xl font-bold text-gem-green">{confidentCount.toLocaleString()}</p>
+                  <p className="text-xs text-gem-muted">Confident matches</p>
                 </div>
-                {confidentCount !== null && (
-                  <div>
-                    <p className="text-2xl font-bold text-emerald-400">{confidentCount.toLocaleString()}</p>
-                    <p className="text-xs text-gray-400">Confident matches</p>
-                  </div>
-                )}
-                {weakCount !== null && (
-                  <div>
-                    <p className="text-2xl font-bold text-amber-400">{weakCount.toLocaleString()}</p>
-                    <p className="text-xs text-gray-400">Weak — needs review</p>
-                  </div>
-                )}
-              </div>
-              <div className="flex gap-3">
-                <button onClick={handleDownload} className="bg-green-600 hover:bg-green-500 text-white font-semibold px-5 py-2.5 rounded-lg">Download CSV</button>
-                <button onClick={reset} className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2.5 rounded-lg text-sm">New comparison</button>
+              )}
+              {weakCount !== null && (
+                <div>
+                  <p className="text-2xl font-bold text-amber-600">{weakCount.toLocaleString()}</p>
+                  <p className="text-xs text-gem-muted">Weak, needs review</p>
+                </div>
+              )}
+            </div>
+            <div className="flex gap-3">
+              <button onClick={handleDownload} className="gem-btn gem-btn-success">Download CSV</button>
+              <button onClick={reset} className="gem-btn gem-btn-ghost">New comparison</button>
+            </div>
+          </div>
+
+          {/* View switcher — List / Comparison Analytics / Analysis (one at a time) */}
+          {result.rows && result.rows.length > 0 && (
+            <div className="inline-flex rounded-md border border-gem-border overflow-hidden text-sm">
+              {[
+                ["list", "Comparison List"],
+                ["analytics", "Comparison Analytics"],
+                ["analysis", "Analysis"],
+              ].map(([id, label], i) => (
+                <button
+                  key={id}
+                  onClick={() => setResultView(id)}
+                  className={`px-4 py-2 font-medium transition-colors ${i > 0 ? "border-l border-gem-border" : ""} ${
+                    resultView === id ? "bg-gem-blue text-white" : "bg-white text-gem-text hover:bg-slate-50"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Comparison Analytics — department-focused view */}
+          {result.rows && result.rows.length > 0 && resultView === "analytics" && (
+            <ResultsVisualizer rows={result.rows} />
+          )}
+
+          {/* Analysis — category activity, similarity, and specification analyses */}
+          {result.rows && result.rows.length > 0 && resultView === "analysis" && (
+            <AnalysisView rows={result.rows} />
+          )}
+
+          {/* List — the full result table, every row, all columns (no cap) */}
+          {result.rows && result.rows.length > 0 && resultView === "list" && (
+            <div className="gem-card overflow-hidden">
+              <p className="px-4 pt-3 text-xs text-gem-muted">
+                Showing all <span className="font-semibold text-gem-text">{result.rows.length.toLocaleString()}</span> records.
+                The downloaded file also includes the Searched Strings, Searched Result and Relevant Categories columns.
+              </p>
+              <div className="overflow-auto max-h-[70vh]">
+                <table className="gem-table">
+                  <thead className="sticky top-0 z-10">
+                    <tr>
+                      <th>Bid No</th><th>Department</th><th>Item Category</th><th>Matched Category</th><th>Match Label</th><th>Score</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.rows.map((row, i) => (
+                      <tr key={i}>
+                        <td className="font-mono text-xs text-gem-blue whitespace-nowrap">{row["Bid No"]}</td>
+                        <td className="text-gem-text text-xs">{row["Department"] || "—"}</td>
+                        <td className="text-gem-text max-w-xs">{row["Item Category"]}</td>
+                        <td className="text-gem-text max-w-xs">{row["Matched Category"]}</td>
+                        <td className="whitespace-nowrap">
+                          <span className={`gem-badge ${verdictStyle(row)}`}>{row["Match Label"]}</span>
+                        </td>
+                        <td className="whitespace-nowrap text-gem-muted text-xs">{row["Match Score"]}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </div>
-
-            {!result.inline && (
-              <div className="bg-gray-900 rounded-2xl p-8 text-center space-y-3">
-                <div className="text-4xl">📄</div>
-                <p className="text-white font-semibold">{result.total.toLocaleString()} rows — too large to display here</p>
-                <p className="text-gray-400 text-sm max-w-md mx-auto">
-                  Results above 300 rows aren't rendered here. Use <span className="text-green-400 font-medium">Download CSV</span> for the
-                  full file — every Custom Bid Extractor column plus Matched Category, Match Label and Score.
-                </p>
-              </div>
-            )}
-
-            {result.inline && result.rows && (
-              <div className="bg-gray-900 rounded-2xl overflow-hidden">
-                <p className="px-4 pt-3 text-xs text-gray-500">
-                  Showing key columns — the downloaded CSV includes all extractor fields
-                  (Searched Strings, Searched Result, Relevant Categories) too.
-                </p>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="bg-gray-800 text-gray-300 text-left">
-                        <th className="px-4 py-3 font-semibold whitespace-nowrap">Bid No</th>
-                        <th className="px-4 py-3 font-semibold">Item Category</th>
-                        <th className="px-4 py-3 font-semibold">Matched Category</th>
-                        <th className="px-4 py-3 font-semibold whitespace-nowrap">Match Label</th>
-                        <th className="px-4 py-3 font-semibold whitespace-nowrap">Score</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {result.rows.map((row, i) => (
-                        <tr key={i} className="border-t border-gray-800 hover:bg-gray-800/50 align-top">
-                          <td className="px-4 py-3 font-mono text-xs text-blue-300 whitespace-nowrap">{row["Bid No"]}</td>
-                          <td className="px-4 py-3 text-gray-200 max-w-xs">{row["Item Category"]}</td>
-                          <td className="px-4 py-3 text-gray-200 max-w-xs">{row["Matched Category"]}</td>
-                          <td className="px-4 py-3 whitespace-nowrap">
-                            <span className={`inline-block px-2.5 py-1 rounded-md border text-xs font-semibold ${verdictStyle(row)}`}>
-                              {row["Match Label"]}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 whitespace-nowrap text-gray-300 text-xs">{row["Match Score"]}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-      </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

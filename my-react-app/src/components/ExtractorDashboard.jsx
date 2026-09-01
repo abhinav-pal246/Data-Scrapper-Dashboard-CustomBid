@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 
-const API = "http://127.0.0.1:5000";
+const API = ""; // same-origin; Vite proxies /api -> Flask (see vite.config.js)
 
 // Reusable extractor UI for both Custom Bid and Category Bid modules.
 // Start = fresh · Pause = stop & keep (resume later) · Cancel = discard & reset.
@@ -9,7 +9,7 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
 
   const [count, setCount]     = useState("");
   const [allBids, setAllBids] = useState(false);
-  const [status, setStatus]   = useState("idle"); // idle|running|paused|done|error
+  const [status, setStatus]   = useState("idle"); // idle|running|paused|retrying|hold|done|error
   const [job, setJob]         = useState({ phase: "", collected: 0, total: 0, written: 0, failed: 0, paused: false });
   const [timeLeft, setTimeLeft] = useState(null);
   const startRef = useRef(null);
@@ -17,33 +17,27 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
 
   const ACTIVE = ["running", "paused", "retrying", "hold"];
 
-  // Poll while the job is active (running / paused / retrying / hold).
   useEffect(() => {
     if (!ACTIVE.includes(status)) return;
     pollRef.current = setInterval(async () => {
       try {
         const data = await (await fetch(`${base}/status`)).json();
         setJob(data);
-
         if (data.phase === "extracting" && data.written > 0 && data.status === "running") {
           const elapsed = (Date.now() - startRef.current) / 1000;
           const rate    = data.written / elapsed;
-          if (rate > 0 && data.total > 0)
-            setTimeLeft(Math.round((data.total - data.written) / rate));
+          if (rate > 0 && data.total > 0) setTimeLeft(Math.round((data.total - data.written) / rate));
         }
-
         if (data.done) {
           clearInterval(pollRef.current);
           setStatus(data.status === "error" ? "error" : "done");
         } else if (data.status === "idle") {
           clearInterval(pollRef.current);
-          setStatus("idle");                 // cancelled → reset
+          setStatus("idle");
         } else {
-          setStatus(data.status);            // running | paused | retrying | hold
+          setStatus(data.status);
         }
-      } catch (err) {
-        console.error("poll error:", err);   // frontend can't reach Flask — keep trying
-      }
+      } catch (err) { console.error("poll error:", err); }
     }, 1000);
     return () => clearInterval(pollRef.current);
   }, [status, base]);
@@ -60,14 +54,12 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
     setJob({ phase: "collecting", collected: 0, total: 0, written: 0, failed: 0, paused: false });
     setTimeLeft(null);
     const res = await fetch(`${base}/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ count: allBids ? "all" : count }),
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
-      alert(d.error || "Could not start.");
-      setStatus("idle");
+      alert(d.error || "Could not start."); setStatus("idle");
     }
   };
 
@@ -85,37 +77,33 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
 
   const pct = job.total > 0 ? Math.round((job.written / job.total) * 100) : 0;
   const fmt = (s) => (!s || s < 0 ? "calculating…" : s < 60 ? `${s}s left` : `${Math.floor(s / 60)}m ${s % 60}s left`);
-
-  const accentBtn = accent === "teal" ? "bg-teal-600 hover:bg-teal-500" : "bg-blue-600 hover:bg-blue-500";
   const active = ACTIVE.includes(status);
+  const startBtn = accent === "green" ? "gem-btn-success" : "gem-btn-primary";
+  const barColor = status === "paused" ? "bg-amber-500" : accent === "green" ? "bg-gem-green" : "bg-gem-blue";
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white flex items-start justify-center p-6">
-      <div className="w-full max-w-xl bg-gray-900 rounded-2xl shadow-2xl p-8 space-y-6 mt-6">
+    <div className="gem-wrap max-w-3xl py-8">
+      <div className="gem-card gem-card-accent gem-card-pad space-y-6">
+
         <div>
-          <h1 className="text-2xl font-bold text-white">{title}</h1>
-          <p className="text-gray-400 text-sm mt-1">{subtitle}</p>
+          <h1 className="gem-title">{title}</h1>
+          <p className="gem-sub">{subtitle}</p>
         </div>
 
         {/* IDLE */}
         {status === "idle" && (
           <div className="space-y-4">
-            <div className="space-y-2">
-              <label className="text-sm text-gray-300">Number of bids to retrieve</label>
-              <input
-                type="number" value={count} onChange={(e) => setCount(e.target.value)}
-                disabled={allBids} placeholder="e.g. 20"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-white
-                           placeholder-gray-500 focus:outline-none focus:border-blue-500 disabled:opacity-40"
-              />
+            <div>
+              <label className="gem-label">Number of bids to retrieve</label>
+              <input type="number" value={count} onChange={(e) => setCount(e.target.value)}
+                     disabled={allBids} placeholder="For example, 20" className="gem-input" />
             </div>
             <label className="flex items-center gap-3 cursor-pointer">
               <input type="checkbox" checked={allBids} onChange={(e) => setAllBids(e.target.checked)}
-                     className="w-4 h-4 accent-blue-500" />
-              <span className="text-sm text-gray-300">Retrieve ALL active bids</span>
+                     className="w-4 h-4 accent-gem-blue" />
+              <span className="text-sm text-gem-text">Retrieve all active bids</span>
             </label>
-            <button onClick={handleStart}
-              className={`w-full ${accentBtn} text-white font-semibold py-3 rounded-lg transition-colors`}>
+            <button onClick={handleStart} className={`gem-btn ${startBtn} w-full py-3`}>
               Start Extraction
             </button>
           </div>
@@ -124,62 +112,61 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
         {/* RUNNING / PAUSED / RETRYING / HOLD */}
         {active && (
           <div className="space-y-5">
-            {/* Network banner */}
             {status === "retrying" && (
-              <div className="rounded-lg p-3 border border-yellow-600 bg-yellow-950/60 flex items-center gap-3">
-                <div className="w-4 h-4 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin" />
-                <p className="text-xs text-yellow-200">
-                  Network/server issue — auto-retrying (attempt {job.attempt}/{job.max_attempts})…
-                  {job.hold_reason ? ` [${job.hold_reason}]` : ""} Progress is preserved.
+              <div className="rounded-md p-3 border border-amber-300 bg-amber-50 flex items-center gap-3">
+                <div className="w-4 h-4 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+                <p className="text-xs text-amber-800">
+                  A network or server issue occurred. Retrying automatically (attempt {job.attempt} of {job.max_attempts}).
+                  Your progress is preserved.
                 </p>
               </div>
             )}
             {status === "hold" && (
-              <div className="rounded-lg p-4 border border-red-600 bg-red-950/60 space-y-1">
-                <p className="text-sm font-semibold text-red-300">⏸ On hold — couldn’t reach GeM</p>
-                <p className="text-xs text-red-200/80">
-                  Auto-retry failed after {job.max_attempts} attempts{job.hold_reason ? ` (${job.hold_reason})` : ""}.
-                  Your progress is safe. Retry when your connection/GeM is back, or export what’s collected.
+              <div className="rounded-md p-4 border border-red-300 bg-red-50 space-y-1">
+                <p className="text-sm font-semibold text-gem-red">On hold. Unable to reach GeM.</p>
+                <p className="text-xs text-red-700/90">
+                  Automatic retries were unsuccessful after {job.max_attempts} attempts.
+                  Your progress is saved. Retry once the connection is restored, or export the data collected so far.
                 </p>
               </div>
             )}
 
-            <div className={`rounded-lg p-4 border ${
-              status === "paused" ? "border-amber-500 bg-amber-950"
-              : job.phase === "collecting" ? "border-blue-500 bg-blue-950"
-              : "border-gray-700 bg-gray-800 opacity-60"}`}>
+            {/* Phase 1 */}
+            <div className={`rounded-md p-4 border ${
+              status === "paused" ? "border-amber-300 bg-amber-50"
+              : job.phase === "collecting" ? "border-gem-blue/40 bg-blue-50"
+              : "border-gem-border bg-slate-50"}`}>
               <div className="flex items-center gap-3">
                 {status !== "paused" && job.phase === "collecting"
-                  ? <div className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                  : <div className="text-green-400 font-bold">✓</div>}
+                  ? <div className="w-4 h-4 border-2 border-gem-blue border-t-transparent rounded-full animate-spin" />
+                  : <div className="text-gem-green font-bold">✓</div>}
                 <div>
-                  <p className="text-sm font-semibold text-white">Phase 1 — Collecting active bid IDs</p>
-                  <p className="text-xs text-gray-400 mt-0.5">{job.collected} IDs scanned</p>
+                  <p className="text-sm font-semibold text-gem-text">Step 1. Collecting active bid identifiers</p>
+                  <p className="text-xs text-gem-muted mt-0.5">{job.collected} identifiers scanned</p>
                 </div>
               </div>
             </div>
 
-            <div className={`rounded-lg p-4 border ${
-              status === "paused" ? "border-amber-500 bg-amber-950" : "border-purple-500 bg-purple-950"}`}>
+            {/* Phase 2 */}
+            <div className={`rounded-md p-4 border ${
+              status === "paused" ? "border-amber-300 bg-amber-50" : "border-gem-border bg-white"}`}>
               <div className="flex items-center gap-3 mb-3">
                 {status === "paused"
-                  ? <div className="text-amber-400 text-lg leading-none">⏸</div>
-                  : <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />}
+                  ? <div className="text-amber-500 text-lg leading-none">⏸</div>
+                  : <div className={`w-4 h-4 border-2 border-t-transparent rounded-full animate-spin ${accent === "green" ? "border-gem-green" : "border-gem-blue"}`} />}
                 <div>
-                  <p className="text-sm font-semibold text-white">Phase 2 — Extracting active bids</p>
-                  <p className="text-xs text-gray-400 mt-0.5">
-                    {job.written} extracted{job.total ? ` of ${job.total}` : ""}
-                    {status === "paused" && " · paused"}
+                  <p className="text-sm font-semibold text-gem-text">Step 2. Extracting active bids</p>
+                  <p className="text-xs text-gem-muted mt-0.5">
+                    {job.written} extracted{job.total ? ` of ${job.total}` : ""}{status === "paused" && " · paused"}
                   </p>
                 </div>
               </div>
-              <div className="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
-                <div className={`h-3 rounded-full transition-all duration-500 ${status === "paused" ? "bg-amber-500" : "bg-purple-500"}`}
-                     style={{ width: `${pct}%` }} />
+              <div className="w-full bg-slate-200 rounded-full h-2.5 overflow-hidden">
+                <div className={`h-2.5 rounded-full transition-all duration-500 ${barColor}`} style={{ width: `${pct}%` }} />
               </div>
               <div className="flex justify-between text-xs mt-2">
-                <span className="text-gray-400">{job.failed > 0 && `${job.failed} skipped (expired/other)`}</span>
-                <span className={status === "paused" ? "text-amber-400" : "text-purple-400"}>
+                <span className="text-gem-muted">{job.failed > 0 && `${job.failed} skipped`}</span>
+                <span className={status === "paused" ? "text-amber-600" : "text-gem-blue"}>
                   {pct}%{status !== "paused" && ` · ${fmt(timeLeft)}`}
                 </span>
               </div>
@@ -188,49 +175,31 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
             {/* Controls */}
             <div className="flex gap-3">
               {status === "running" && (
-                <button onClick={handlePause}
-                  className="flex-1 bg-amber-600 hover:bg-amber-500 text-white font-semibold py-2.5 rounded-lg transition-colors">
-                  Pause
-                </button>
+                <button onClick={handlePause} className="gem-btn gem-btn-warn flex-1">Pause</button>
               )}
               {status === "paused" && (
                 <>
-                  <button onClick={handleResume}
-                    className="flex-1 bg-green-600 hover:bg-green-500 text-white font-semibold py-2.5 rounded-lg transition-colors">
-                    Resume
-                  </button>
-                  <button onClick={handleDownload}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-2.5 rounded-lg text-sm transition-colors">
-                    Export so far
-                  </button>
+                  <button onClick={handleResume} className="gem-btn gem-btn-success flex-1">Resume</button>
+                  <button onClick={handleDownload} className="gem-btn gem-btn-ghost flex-1">Export collected data</button>
                 </>
               )}
               {status === "hold" && (
                 <>
-                  <button onClick={handleRetry}
-                    className="flex-1 bg-green-600 hover:bg-green-500 text-white font-semibold py-2.5 rounded-lg transition-colors">
-                    Retry now
-                  </button>
-                  <button onClick={handleDownload}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-2.5 rounded-lg text-sm transition-colors">
-                    Extract so far
-                  </button>
+                  <button onClick={handleRetry} className="gem-btn gem-btn-success flex-1">Retry</button>
+                  <button onClick={handleDownload} className="gem-btn gem-btn-ghost flex-1">Export collected data</button>
                 </>
               )}
-              <button onClick={handleCancel}
-                className="flex-1 bg-red-900 hover:bg-red-800 text-red-200 py-2.5 rounded-lg text-sm transition-colors">
-                Cancel
-              </button>
+              <button onClick={handleCancel} className="gem-btn gem-btn-danger flex-1">Cancel</button>
             </div>
 
-            <p className="text-center text-gray-500 text-xs">
+            <p className="text-center gem-help">
               {status === "paused"
-                ? "Paused — data so far is saved. Resume anytime to continue where you left off."
+                ? "Paused. The data collected so far is saved. Resume to continue from where you stopped."
                 : status === "hold"
-                ? "On hold — retries resume from exactly where they stopped. Nothing is lost."
+                ? "On hold. Retrying resumes from the exact point where it stopped. No data is lost."
                 : status === "retrying"
-                ? "Auto-retrying — the job will hold (not crash) if the connection stays down."
-                : "Pause to stop & keep progress · Cancel to discard and pick a new range."}
+                ? "Retrying automatically. If the connection remains unavailable, the process will pause rather than fail."
+                : "Pause to stop and keep your progress. Cancel to discard and choose a new range."}
             </p>
           </div>
         )}
@@ -238,32 +207,23 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
         {/* DONE */}
         {status === "done" && (
           <div className="space-y-4 text-center">
-            <div className="text-green-400 text-5xl">✓</div>
-            <p className="text-white font-semibold text-lg">Extraction complete</p>
-            <p className="text-gray-400 text-sm">
-              {job.written} active bids extracted{job.failed > 0 && `, ${job.failed} skipped`}
+            <div className="mx-auto w-12 h-12 rounded-full bg-green-100 text-gem-green flex items-center justify-center text-2xl">✓</div>
+            <p className="text-gem-text font-semibold text-lg">Extraction complete</p>
+            <p className="text-gem-muted text-sm">
+              {job.written} active bids extracted{job.failed > 0 && `. ${job.failed} skipped`}.
             </p>
-            <button onClick={handleDownload}
-              className="w-full bg-green-600 hover:bg-green-500 text-white font-semibold py-3 rounded-lg transition-colors">
-              Download CSV
-            </button>
-            <button onClick={reset}
-              className="w-full bg-gray-700 hover:bg-gray-600 text-white py-2 rounded-lg text-sm transition-colors">
-              Start new extraction
-            </button>
+            <button onClick={handleDownload} className="gem-btn gem-btn-success w-full py-3">Download CSV</button>
+            <button onClick={reset} className="gem-btn gem-btn-ghost w-full">Start a new extraction</button>
           </div>
         )}
 
         {/* ERROR */}
         {status === "error" && (
           <div className="space-y-4 text-center">
-            <div className="text-red-400 text-5xl">✗</div>
-            <p className="text-red-400 font-semibold">Something went wrong</p>
-            <p className="text-gray-500 text-xs break-all">{job.error}</p>
-            <button onClick={reset}
-              className="w-full bg-gray-700 hover:bg-gray-600 text-white py-2 rounded-lg text-sm transition-colors">
-              Try again
-            </button>
+            <div className="mx-auto w-12 h-12 rounded-full bg-red-100 text-gem-red flex items-center justify-center text-2xl">!</div>
+            <p className="text-gem-red font-semibold">The extraction could not be completed</p>
+            <p className="text-gem-muted text-xs break-all">{job.error}</p>
+            <button onClick={reset} className="gem-btn gem-btn-ghost w-full">Try again</button>
           </div>
         )}
       </div>

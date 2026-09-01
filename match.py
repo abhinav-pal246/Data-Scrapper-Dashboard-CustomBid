@@ -26,6 +26,7 @@ from sentence_transformers import SentenceTransformer
 # ── Config ────────────────────────────────────────────────────────────────────
 INPUT_CSV        = "gemarpts_output.csv"
 CATEGORY_CSV     = "category_reference.csv"  # ← static category list (Name,URL,Created At)
+SYNONYMS_CSV     = "synonyms.csv"            # ← concept → related-terms dictionary
 OUTPUT_CSV       = "match_output.csv"
 EMBEDDINGS_CACHE = "category_embeddings.pkl"
 
@@ -51,6 +52,77 @@ def clean(text):
 def extract_keywords(text):
     words = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower()).split()
     return {w for w in words if len(w) > 2 and w not in STOPWORDS}
+
+
+# ── Synonym / Hinglish query expansion ────────────────────────────────────────
+# A curated concept → related-terms dictionary (synonyms, spelling variations and
+# Hinglish transliterations) lives in SYNONYMS_CSV. When a buyer's search contains
+# any of a concept's terms (e.g. "chashma", "mobail"), we append that concept's
+# whole vocabulary to the query text before embedding, so the search vector is
+# pulled toward the right category domain — matching by *meaning*, not just the
+# exact words the buyer typed.
+_SYNONYM_CONCEPTS = None   # list of {concept, hint, terms(set), expansion(str)}
+
+
+def _norm(text):
+    """Lowercase, strip punctuation to spaces, collapse whitespace."""
+    return " ".join(re.sub(r"[^a-z0-9\s]", " ", (text or "").lower()).split())
+
+
+def load_synonyms():
+    """Load and cache the concept dictionary from SYNONYMS_CSV (once)."""
+    global _SYNONYM_CONCEPTS
+    if _SYNONYM_CONCEPTS is not None:
+        return _SYNONYM_CONCEPTS
+
+    concepts = []
+    if os.path.exists(SYNONYMS_CSV):
+        with open(SYNONYMS_CSV, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                concept = (row.get("concept") or "").strip()
+                hint    = (row.get("category_hint") or "").strip()
+                terms   = {_norm(t) for t in (row.get("terms") or "").split(";") if t.strip()}
+                terms.discard("")
+                if not concept or not terms:
+                    continue
+                # The expansion text the query is enriched with when this concept
+                # is hit: the concept label + its category hint + every term.
+                expansion = " ".join([_norm(concept), hint] + sorted(terms))
+                concepts.append({"concept": concept, "hint": hint,
+                                 "terms": terms, "expansion": expansion})
+        print(f"Loaded {len(concepts)} synonym concepts from {SYNONYMS_CSV}")
+    else:
+        print(f"No synonym dictionary at {SYNONYMS_CSV} — query expansion disabled")
+    _SYNONYM_CONCEPTS = concepts
+    return concepts
+
+
+def expand_query(text_raw):
+    """
+    Enrich a search with synonym/Hinglish context.
+
+    Returns (expanded_text, matched_concepts):
+        expanded_text     — original text + the vocabulary of every concept it hits
+        matched_concepts  — list of concept labels that were triggered
+
+    A concept is triggered when any of its terms appears as a whole word/phrase in
+    the query (word-boundary match, so "ac" won't fire on "machine"). If nothing
+    matches, the original text is returned unchanged.
+    """
+    concepts = load_synonyms()
+    padded   = f" {_norm(text_raw)} "
+    if not concepts or not padded.strip():
+        return text_raw, []
+
+    matched, additions = [], []
+    for c in concepts:
+        if any(f" {term} " in padded for term in c["terms"]):
+            matched.append(c["concept"])
+            additions.append(c["expansion"])
+
+    if not additions:
+        return text_raw, []
+    return f"{text_raw} {' '.join(additions)}", matched
 
 
 def generate_reason(custom_item, matched_category, verdict):
@@ -281,6 +353,82 @@ def get_category_embeddings(categories, model, progress=_noop, checkpoint=_noop_
     return emb
 
 
+# ── Single-item lookup (for the Bid Lookup panel) ─────────────────────────────
+_SINGLE_CACHE = None
+
+
+def _single_artifacts():
+    """Prepare + cache the category artifacts once, for fast repeated lookups."""
+    global _SINGLE_CACHE
+    if _SINGLE_CACHE is None:
+        cats, _bmap    = load_categories()
+        clean_cats     = [clean(c) for c in cats]
+        vectorizer, tfm = build_tfidf(clean_cats)
+        model          = get_model()
+        emb            = get_category_embeddings(cats, model)
+        _SINGLE_CACHE  = (cats, clean_cats, vectorizer, tfm, model, emb)
+    return _SINGLE_CACHE
+
+
+def match_single(item_raw):
+    """
+    Match ONE custom item against the category list. Returns
+    {category, score (0-100), label, layer} — running fuzzy → TF-IDF →
+    embedding and falling back to the nearest embedding ("Weak") below threshold.
+    """
+    cats, clean_cats, vectorizer, tfm, model, emb = _single_artifacts()
+    item = clean(item_raw)
+
+    m, s = layer1_fuzzy(item, clean_cats, cats)
+    if m:
+        return {"category": m, "score": round(float(s), 1),
+                "label": "Strong match", "layer": "fuzzy"}
+
+    m, s = layer2_tfidf(item, vectorizer, tfm, cats)
+    if m:
+        return {"category": m, "score": round(float(s) * 100, 1),
+                "label": "Likely match", "layer": "TF-IDF"}
+
+    m, s = layer3_embeddings(item, model, emb, cats)
+    if m:
+        return {"category": m, "score": round(float(s) * 100, 1),
+                "label": "Possible match", "layer": "embedding"}
+
+    # below every threshold → nearest embedding, flagged weak
+    sims = cosine_similarity(model.encode([item], convert_to_numpy=True), emb).flatten()
+    idx  = int(np.argmax(sims))
+    return {"category": cats[idx], "score": round(float(sims[idx]) * 100, 1),
+            "label": "Weak (review)", "layer": "embedding (nearest)"}
+
+
+def recommend(item_raw, k=5):
+    """
+    Recommend the existing GeM categories a buyer's item most closely resembles,
+    ranked by semantic similarity so the primary is always the closest match and
+    every score is on the same 0-100 scale.
+
+    Returns:
+        {
+          "primary":    {category, score (0-100)},          # closest category
+          "candidates": [{category, similarity (0-100)}, …] # next closest, excl. primary
+        }
+    The caller applies GeM policy to `primary.score` to advise whether a standard
+    Category Bid should be used instead of a Custom Bid.
+
+    The raw query is first passed through `expand_query`, so synonym / Hinglish
+    searches (e.g. "chashma", "mobail") are matched by meaning rather than by the
+    exact words typed. `matched_concepts` lists the concepts that were triggered.
+    """
+    cats, clean_cats, vectorizer, tfm, model, emb = _single_artifacts()
+    expanded, matched_concepts = expand_query(item_raw)
+    sims  = cosine_similarity(model.encode([clean(expanded)], convert_to_numpy=True), emb).flatten()
+    order = np.argsort(sims)[::-1][:max(k, 1) + 1]
+    ranked = [{"category": cats[int(i)], "similarity": round(float(sims[int(i)]) * 100, 1)} for i in order]
+    primary = {"category": ranked[0]["category"], "score": ranked[0]["similarity"]}
+    return {"primary": primary, "candidates": ranked[1:1 + k],
+            "matched_concepts": matched_concepts}
+
+
 def _best_match_chunked(item_vectors, cat_matrix, threshold, always=False):
     """
     For each item vector, return the best-matching (category_index, score).
@@ -410,16 +558,20 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
                                  "Layer 3 · sentence embeddings (semantic)")
             else:
                 # nearest catalogue category, but below the confidence bar
-                match_info[i] = (cat, round(sc, 3), "Weak — review",
+                match_info[i] = (cat, round(sc, 3), "Weak (review)",
                                  "Nearest · below confidence threshold")
 
-    # ── Assemble results in original order ────────────────────────────────────
+    # ── Assemble results, ordered from strongest match to weakest ─────────────
     # Output = every Custom Bid Extractor column carried over as-is, plus the
     # matched category (from the static CSV), the strength label, and the score.
+    # Rows are sorted by confidence tier first, then by the numeric score within
+    # that tier, so the highest matches appear at the top of both the dashboard
+    # list and the downloaded CSV.
     progress(phase="Building results")
-    results   = []
+    scored    = []
     matched_n = 0
     CONFIDENT = {"Strong match", "Likely match", "Possible match"}
+    TIER_RANK = {"Strong match": 4, "Likely match": 3, "Possible match": 2, "Weak (review)": 1}
     for i, (row, item_raw, _clean) in enumerate(items):
         match, score, verdict, _layer = match_info[i]
         if verdict in CONFIDENT:
@@ -428,7 +580,12 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
         out["Matched Category"] = match or "—"
         out["Match Label"]      = verdict or "No match"
         out["Match Score"]      = format_score(score, verdict)
-        results.append(out)
+        # normalise the score to 0-100 (fuzzy is already 0-100; cosine is 0-1)
+        norm = float(score) if verdict == "Strong match" else float(score) * 100.0
+        scored.append(((TIER_RANK.get(verdict, 0), norm), out))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    results = [out for _, out in scored]
 
     # Always write the full CSV so the frontend can offer a download.
     progress(phase="Writing CSV", processed=total, matched=matched_n)

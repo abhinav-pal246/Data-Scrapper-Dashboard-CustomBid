@@ -6,15 +6,18 @@ import time
 import csv as _csv
 import requests
 
+import re
 from gem_gemarpts_scraper import (
     process_one, build_session, append_row,
     load_processed_bids, prime_session, fetch_listing_page,
-    fetch_listing_targets
+    fetch_listing_targets, search_bid_docid, classify_and_extract
 )
 from collect_categories import (
     fetch_product_ids_page, fetch_pdf_bytes as cat_fetch_pdf, extract_from_pdf
 )
-from match import run_matching_job
+from match import run_matching_job, match_single, recommend
+
+BID_NO_PATTERN = re.compile(r"^GEM/\d{4}/[A-Z]/\d+$", re.IGNORECASE)
 
 app = Flask(__name__)
 CORS(app)
@@ -256,7 +259,7 @@ def collect_custom_bids(session, needed, compare_all, progress,
             break                            # listing exhausted
         page += 1
 
-        for pdf_id, bid_no in targets:
+        for pdf_id, bid_no, *_dept in targets:
             if checkpoint:
                 checkpoint()
             if not unbounded and len(rows) >= needed:
@@ -312,11 +315,12 @@ def _load_done_category(path):
     return done
 
 
-def _extract_custom(session, pdf_id, listing_bid_no):
+def _extract_custom(session, pdf_id, listing_bid_no, dept=""):
     """
     Extract a custom bid via its (parent) PDF. Returns (bid_no, writer) or None.
     Transient network/server errors are re-raised so the retry/hold guard can
     handle them; permanent problems (expired/empty PDF) return None (skip).
+    The buyer `dept` (from the listing) is stored alongside the extracted fields.
     """
     try:
         row = process_one(session, listing_bid_no, pdf_id)
@@ -327,6 +331,7 @@ def _extract_custom(session, pdf_id, listing_bid_no):
     item = (row or {}).get("item_category", "").strip() if row else ""
     no   = (row or {}).get("bid_no", "") or listing_bid_no
     if item and no:
+        row["department"] = dept
         return no, (lambda: append_row(CUSTOM_OUTPUT_CSV, row))
     return None
 
@@ -340,10 +345,11 @@ def _append_category_row(path, name, bid_no, doc_id):
         w.writerow({"Category Name": name, "Category Bid No": bid_no, "Doc ID": doc_id})
 
 
-def _extract_category(session, pdf_id, listing_bid_no):
+def _extract_category(session, pdf_id, listing_bid_no, dept=""):
     """
     Extract a true Category Bid (skips Custom Bids, which carry a GeMARPTS block).
-    Returns (bid_no, writer) or None.
+    Returns (bid_no, writer) or None. `dept` is accepted for a uniform signature
+    but not stored (category output has its own schema).
     """
     try:
         pdf = cat_fetch_pdf(session, pdf_id)
@@ -376,7 +382,7 @@ EXTRACTORS = {
         "ctrl":      JobControl(),
         "output":    CATEGORY_OUTPUT_CSV,
         "dl_name":   "category_bids.csv",
-        "listing":   lambda s, p, t: [(i, "") for i in fetch_product_ids_page(s, p, t)],
+        "listing":   lambda s, p, t: [(i, "", "") for i in fetch_product_ids_page(s, p, t)],
         "extract":   _extract_category,
         "load_done": _load_done_category,
         "meta":      "category_meta.json",
@@ -451,7 +457,7 @@ def _run_extractor(cfg, target, is_all, resume):
                 first = False
             ctrl.update(collected=collected, total=(collected if is_all else target))
 
-            for pdf_id, bid_no in targets:
+            for pdf_id, bid_no, dept in targets:
                 ctrl.checkpoint()
                 if not is_all and written >= target:
                     break
@@ -459,7 +465,7 @@ def _run_extractor(cfg, target, is_all, resume):
                     continue
                 seen_ids.add(pdf_id)
 
-                res = ctrl.guard(lambda: cfg["extract"](session, pdf_id, bid_no),
+                res = ctrl.guard(lambda: cfg["extract"](session, pdf_id, bid_no, dept),
                                  "Fetching bid document")
                 if res and res[0] not in done:
                     res[1]()                         # write the row
@@ -786,13 +792,78 @@ def compare_available():
 # ── Endpoint 6: Compare result (rows, once done) ──────────────────────────────
 @app.route("/api/compare/result", methods=["GET"])
 def compare_result():
+    # Always return every row — the dashboard renders the full result set
+    # (no 300-row cap). Empty while a run is still collecting with no results yet.
     with compare_lock:
-        if compare_job["status"] != "done":
-            return jsonify({"error": "Comparison not finished yet"}), 409
-        total  = compare_job["result_total"]
-        inline = compare_job["inline"]
-        rows   = list(compare_results) if inline else None
-    return jsonify({"total": total, "inline": inline, "rows": rows})
+        rows   = list(compare_results)
+        total  = compare_job.get("result_total") or len(rows)
+        status = compare_job.get("status")
+    return jsonify({"total": total, "rows": rows, "status": status})
+
+
+# ── Category Recommendation: closest existing category for an item description ─
+@app.route("/api/recommend", methods=["POST"])
+def recommend_ep():
+    """
+    Given a buyer's item category / requirement text, return the closest
+    existing GeM categories (primary + alternatives). The frontend applies GeM
+    policy to advise whether a standard Category Bid should be used.
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if len(text) < 3:
+        return jsonify({"error": "Enter the item category or requirement to get a recommendation."}), 400
+    try:
+        return jsonify(recommend(text))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Bid Lookup: classify a single bid & match it (on-demand) ──────────────────
+@app.route("/api/lookup", methods=["POST"])
+def lookup():
+    """
+    Look up one bid number: resolve it to its document, classify it
+    (Custom vs Category by the GeMARPTS block), and — if Custom — match its
+    item category against the reference list.
+
+    Response:
+      found=False                          → not in the active listing
+      classification="category"           → "N/A — already a category bid"
+      classification="custom" + match{...} → matched category, score, layer
+    """
+    data   = request.get_json(silent=True) or {}
+    bid_no = (data.get("bidNo") or "").strip().upper()
+
+    if not BID_NO_PATTERN.match(bid_no):
+        return jsonify({"error": "Please enter a complete bid number, for example GEM/2026/B/1234567."}), 400
+
+    try:
+        session = build_session()
+        token   = prime_session(session)
+        pdf_id, resolved = search_bid_docid(session, token, bid_no)
+        if not pdf_id:
+            return jsonify({
+                "bidNo": bid_no, "found": False,
+                "message": "This bid was not found in the current active listing. "
+                           "It may be closed or expired.",
+            })
+
+        classification, item = classify_and_extract(session, pdf_id)
+        if classification == "category":
+            return jsonify({
+                "bidNo": bid_no, "found": True, "classification": "category",
+                "message": "This is already an existing category bid.",
+            })
+
+        # Custom bid → run the match pipeline on its item category.
+        match = match_single(item) if item else None
+        return jsonify({
+            "bidNo": bid_no, "found": True, "classification": "custom",
+            "itemCategory": item, "match": match,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Endpoint 7: Download comparison result ────────────────────────────────────

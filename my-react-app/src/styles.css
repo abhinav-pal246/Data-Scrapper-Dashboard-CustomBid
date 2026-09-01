@@ -1,3 +1,75 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  html, body, #root { @apply h-full; }
+  body {
+    @apply bg-gem-bg text-gem-text font-gem antialiased;
+    font-feature-settings: "kern", "liga", "tnum";
+    text-rendering: optimizeLegibility;
+    line-height: 1.55;
+  }
+  h1, h2, h3 { @apply tracking-tight; }
+}
+
+@layer components {
+  /* Layout */
+  .gem-page   { @apply min-h-screen; }
+  .gem-wrap   { @apply w-full mx-auto px-4 sm:px-6; }
+
+  /* Cards */
+  .gem-card       { @apply bg-white border border-gem-border rounded-lg shadow-sm; }
+  .gem-card-pad   { @apply p-6; }
+  .gem-card-accent{ @apply border-t-4 border-t-gem-orange; }
+
+  /* Section headings */
+  .gem-title { @apply text-xl sm:text-2xl font-bold text-gem-text tracking-tight leading-tight; }
+  .gem-sub   { @apply text-sm text-gem-muted mt-1.5 leading-relaxed max-w-3xl; }
+
+  /* Form controls */
+  .gem-label { @apply block text-sm font-semibold text-gem-text mb-1.5; }
+  .gem-help  { @apply text-xs text-gem-muted; }
+  .gem-input {
+    @apply w-full bg-white border border-gem-border rounded-md px-4 py-2.5 text-gem-text
+           placeholder-slate-400 focus:outline-none focus:border-gem-blue
+           focus:ring-2 focus:ring-gem-blue/20 disabled:opacity-50 disabled:bg-slate-50;
+  }
+
+  /* Buttons */
+  .gem-btn {
+    @apply inline-flex items-center justify-center gap-2 font-semibold rounded-md
+           px-5 py-2.5 text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .gem-btn-primary { @apply bg-gem-blue hover:bg-gem-bluedark text-white; }
+  .gem-btn-success { @apply bg-gem-green hover:bg-green-700 text-white; }
+  .gem-btn-warn    { @apply bg-gem-orange hover:bg-orange-600 text-white; }
+  .gem-btn-danger  { @apply bg-white border border-gem-red/40 text-gem-red hover:bg-red-50; }
+  .gem-btn-ghost   { @apply bg-white border border-gem-border text-gem-text hover:bg-slate-50; }
+
+  /* Tables */
+  .gem-table  { @apply w-full text-sm border-collapse; }
+  .gem-table thead th {
+    @apply bg-slate-50 text-gem-text text-left font-semibold px-4 py-3
+           border-b border-gem-border whitespace-nowrap;
+  }
+  .gem-table tbody td { @apply px-4 py-3 border-b border-gem-border align-top; }
+  .gem-table tbody tr:hover { @apply bg-slate-50/70; }
+
+  /* Badges */
+  .gem-badge { @apply inline-block px-2.5 py-1 rounded-md border text-xs font-semibold; }
+
+  /* Nav tabs (in the header) — active gets the GeM orange underline */
+  .gem-tab {
+    @apply px-4 py-3 text-sm font-medium text-white/75 hover:text-white
+           border-b-[3px] border-transparent transition-colors;
+  }
+  .gem-tab-active { @apply text-white border-b-[3px] border-gem-orange; }
+
+  /* GeM tricolor divider */
+  .gem-divider {
+    height: 3px;
+    background: linear-gradient(to right,
+      #d9382a 0%, #ef7a1f 33%, #aeb800 33%, #3f9142 66%, #1f6fb8 66%, #16357e 100%);
+  }
+}

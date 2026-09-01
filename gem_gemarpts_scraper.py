@@ -165,17 +165,18 @@ def resolve_target(doc):
     showbidDocument is EMPTY — the real PDF lives under their parent bid
     (GEM/…/B/…). So prefer the parent id + parent bid number when present.
 
-    Returns (pdf_doc_id, bid_no) as strings.
+    Returns (pdf_doc_id, bid_no, department) as strings.
     """
     own_id = _first(doc.get("id")) or _first(doc.get("b_id"))
     own_no = _first(doc.get("b_bid_number")) or ""
+    dept   = _first(doc.get("ba_official_details_deptName")) or ""
 
     par_id = _first(doc.get("b_id_parent"))
     par_no = _first(doc.get("b_bid_number_parent")) or ""
 
     if par_id:
-        return str(par_id), (par_no or own_no)
-    return str(own_id) if own_id else None, own_no
+        return str(par_id), (par_no or own_no), dept
+    return (str(own_id) if own_id else None), own_no, dept
 
 
 def fetch_listing_docs(session, page, token):
@@ -193,20 +194,85 @@ def fetch_listing_docs(session, page, token):
 
 def fetch_listing_targets(session, page, token):
     """
-    Return [(pdf_doc_id, bid_no), …] for one listing page — each already
-    resolved to the parent document that carries the GeMARPTS PDF.
+    Return [(pdf_doc_id, bid_no, department), …] for one listing page — each
+    already resolved to the parent document that carries the GeMARPTS PDF.
     """
     targets = []
     for d in fetch_listing_docs(session, page, token):
-        pdf_id, bid_no = resolve_target(d)
+        pdf_id, bid_no, dept = resolve_target(d)
         if pdf_id:
-            targets.append((pdf_id, bid_no))
+            targets.append((pdf_id, bid_no, dept))
     return targets
 
 
 def fetch_listing_page(session, page, token):
     """Back-compat: page of resolved PDF doc-ids (parent-aware)."""
-    return [pdf_id for pdf_id, _ in fetch_listing_targets(session, page, token)]
+    return [t[0] for t in fetch_listing_targets(session, page, token)]
+
+
+# ── Single-bid lookup: bid number → doc id, and classify (custom vs category) ──
+def build_search_payload(page, token, query, by_type):
+    import json as _json
+    obj = {
+        "page": page,
+        "param": {"searchBid": query, "searchType": "fullText"},
+        "filter": {
+            "bidStatusType": "ongoing_bids",
+            "byType": by_type,
+            "highBidValue": "",
+            "byEndDate": {"from": "", "to": ""},
+            "sort": "Bid-End-Date-Oldest",
+        },
+    }
+    return {"payload": _json.dumps(obj), "csrf_bd_gem_nk": token}
+
+
+def _search_listing_docs(session, token, query, by_type):
+    data = build_search_payload(1, token, query, by_type)
+    r = session.post(LISTING_URL, data=data, headers=LISTING_HEADERS,
+                     timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    try:
+        j = r.json()
+    except ValueError:
+        return []
+    return (((j or {}).get("response") or {}).get("response") or {}).get("docs") or []
+
+
+def search_bid_docid(session, token, bid_no):
+    """
+    Find the PDF doc id for a bid NUMBER by searching the ongoing listing
+    (custom + product). Prefers an exact match on the bid's own or parent bid
+    number; returns (pdf_doc_id, resolved_bid_no) or (None, None).
+    """
+    want = bid_no.strip().upper()
+    for by in ("custom", "product"):
+        try:
+            docs = _search_listing_docs(session, token, want, by)
+        except Exception:
+            docs = []
+        for d in docs:
+            own = (_first(d.get("b_bid_number")) or "").upper()
+            par = (_first(d.get("b_bid_number_parent")) or "").upper()
+            if want in (own, par):
+                pdf_id, resolved_no, _dept = resolve_target(d)
+                return pdf_id, resolved_no
+    return None, None
+
+
+def classify_and_extract(session, doc_id):
+    """
+    Fetch the bid PDF and classify it: returns ('custom', item_category) when a
+    GeMARPTS block is present, else ('category', None). Raises if the PDF can't
+    be fetched (empty/expired).
+    """
+    pdf_bytes = fetch_pdf_bytes(session, doc_id)
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = extract_full_text(pdf)
+        if GEMARPTS_RE.search(text or ""):
+            fields = extract_fields(pdf)
+            return "custom", (fields.get("item_category") or "").strip()
+        return "category", None
 
 
 def collect_ids_to_file(session, out_path=IDS_FILE):
@@ -391,7 +457,7 @@ def extract_full_text(pdf):
 # ----------------------------------------------------------------------------
 
 CSV_HEADER = ["Bid No", "Item Category", "Searched Strings",
-              "Searched Result", "Relevant Categories"]
+              "Searched Result", "Relevant Categories", "Department"]
 
 
 def load_processed_bids(csv_path):
@@ -411,7 +477,8 @@ def append_row(csv_path, row):
         if new:
             w.writerow(CSV_HEADER)
         w.writerow([row["bid_no"], row["item_category"], row["searched_strings"],
-                    row["searched_result"], row["relevant_categories"]])
+                    row["searched_result"], row["relevant_categories"],
+                    row.get("department", "")])
         w.writerow([])
 
 
