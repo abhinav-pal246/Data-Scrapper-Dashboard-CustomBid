@@ -7,10 +7,13 @@ import csv as _csv
 import requests
 
 import re
+import io as _io
+import pdfplumber as _pdfplumber
 from gem_gemarpts_scraper import (
     process_one, build_session, append_row,
     load_processed_bids, prime_session, fetch_listing_page,
-    fetch_listing_targets, search_bid_docid, classify_and_extract
+    fetch_listing_targets, search_bid_docid, classify_and_extract,
+    extract_consignee_state, STATE_NAMES
 )
 from collect_categories import (
     fetch_product_ids_page, fetch_pdf_bytes as cat_fetch_pdf, extract_from_pdf
@@ -315,12 +318,42 @@ def _load_done_category(path):
     return done
 
 
-def _extract_custom(session, pdf_id, listing_bid_no, dept=""):
+# ── State filter (post-fetch: state is derived from each bid's PDF) ────────────
+# GeM's listing carries no state, so a bid's state is only known after its PDF is
+# fetched and parsed. The filter therefore runs during extraction: a valid bid
+# whose derived state is not selected is returned as _FILTERED — skipped without
+# being stored, and counted separately from genuine extraction failures.
+_FILTERED = object()
+
+
+def _norm_state(s):
+    return " ".join((s or "").strip().lower().split())
+
+
+_STATE_SET = {_norm_state(s) for s in STATE_NAMES}
+
+
+def _clean_states(raw):
+    """Normalise a list of state names to a set of known states, or None for
+    'all states' (no filter). Unknown names are dropped."""
+    if not raw or not isinstance(raw, list):
+        return None
+    picked = {_norm_state(s) for s in raw if _norm_state(s) in _STATE_SET}
+    return picked or None
+
+
+def _state_ok(state, states):
+    """True when no filter is active, or the bid's derived state is selected."""
+    return not states or _norm_state(state) in states
+
+
+def _extract_custom(session, pdf_id, listing_bid_no, dept="", states=None):
     """
-    Extract a custom bid via its (parent) PDF. Returns (bid_no, writer) or None.
+    Extract a custom bid via its (parent) PDF. Returns (bid_no, writer), None
+    (permanent skip), or _FILTERED (valid bid, excluded by the state filter).
     Transient network/server errors are re-raised so the retry/hold guard can
-    handle them; permanent problems (expired/empty PDF) return None (skip).
-    The buyer `dept` (from the listing) is stored alongside the extracted fields.
+    handle them. The buyer `dept` (from the listing) is stored alongside the
+    extracted fields.
     """
     try:
         row = process_one(session, listing_bid_no, pdf_id)
@@ -331,6 +364,8 @@ def _extract_custom(session, pdf_id, listing_bid_no, dept=""):
     item = (row or {}).get("item_category", "").strip() if row else ""
     no   = (row or {}).get("bid_no", "") or listing_bid_no
     if item and no:
+        if not _state_ok(row.get("state", ""), states):
+            return _FILTERED                     # not in a selected state → skip
         row["department"] = dept
         return no, (lambda: append_row(CUSTOM_OUTPUT_CSV, row))
     return None
@@ -345,11 +380,13 @@ def _append_category_row(path, name, bid_no, doc_id):
         w.writerow({"Category Name": name, "Category Bid No": bid_no, "Doc ID": doc_id})
 
 
-def _extract_category(session, pdf_id, listing_bid_no, dept=""):
+def _extract_category(session, pdf_id, listing_bid_no, dept="", states=None):
     """
     Extract a true Category Bid (skips Custom Bids, which carry a GeMARPTS block).
-    Returns (bid_no, writer) or None. `dept` is accepted for a uniform signature
-    but not stored (category output has its own schema).
+    Returns (bid_no, writer), None, or _FILTERED (excluded by the state filter).
+    `dept` is accepted for a uniform signature but not stored (category output has
+    its own schema). State is only derived when a filter is active, to avoid the
+    extra PDF parse otherwise.
     """
     try:
         pdf = cat_fetch_pdf(session, pdf_id)
@@ -363,6 +400,14 @@ def _extract_category(session, pdf_id, listing_bid_no, dept=""):
         return None
     if is_custom or not item:
         return None                          # custom or empty → ignore, don't store
+    if states:
+        try:
+            with _pdfplumber.open(_io.BytesIO(pdf)) as doc:
+                st = extract_consignee_state(doc)
+        except Exception:
+            st = ""
+        if not _state_ok(st, states):
+            return _FILTERED                     # not in a selected state → skip
     no = bno or listing_bid_no or "—"
     return no, (lambda: _append_category_row(CATEGORY_OUTPUT_CSV, item, no, pdf_id))
 
@@ -390,10 +435,11 @@ EXTRACTORS = {
 }
 
 
-def _save_meta(cfg, target, is_all):
+def _save_meta(cfg, target, is_all, states=None):
     try:
         with open(cfg["meta"], "w") as f:
-            json.dump({"target": target, "is_all": is_all}, f)
+            json.dump({"target": target, "is_all": is_all,
+                       "states": sorted(states) if states else None}, f)
     except Exception:
         pass
 
@@ -406,11 +452,16 @@ def _load_meta(cfg):
         return {}
 
 
-def _run_extractor(cfg, target, is_all, resume):
+def _run_extractor(cfg, target, is_all, resume, states=None):
     """
     Fresh (resume=False) wipes the output first; resume=True keeps it and skips
     bids already stored, so the final CSV is cumulative. Pages the live listing,
     extracts active bids only, and honours pause/cancel at every step.
+
+    `states` (a set of normalised state names, or None) is the state filter: when
+    set, only bids delivered to those states are kept, and the `target` count is
+    the number of MATCHING bids to collect — scanning continues past bids in other
+    states until the target is met or the listing is exhausted.
     """
     ctrl   = cfg["ctrl"]
     output = cfg["output"]
@@ -423,9 +474,10 @@ def _run_extractor(cfg, target, is_all, resume):
 
         written  = len(done)
         failed   = 0
+        filtered = 0
         collected = 0
         ctrl.update(status="running", phase="collecting", written=written,
-                    failed=0, collected=0, total=(target or 0),
+                    failed=0, filtered=0, collected=0, total=(target or 0),
                     done=False, error="", paused=False)
 
         session = build_session()
@@ -465,9 +517,12 @@ def _run_extractor(cfg, target, is_all, resume):
                     continue
                 seen_ids.add(pdf_id)
 
-                res = ctrl.guard(lambda: cfg["extract"](session, pdf_id, bid_no, dept),
+                res = ctrl.guard(lambda: cfg["extract"](session, pdf_id, bid_no, dept, states),
                                  "Fetching bid document")
-                if res and res[0] not in done:
+                if res is _FILTERED:
+                    filtered += 1                    # valid bid, other state → skip
+                    ctrl.update(filtered=filtered)
+                elif res and res[0] not in done:
                     res[1]()                         # write the row
                     done.add(res[0])
                     written += 1
@@ -487,6 +542,12 @@ def _run_extractor(cfg, target, is_all, resume):
 
 
 # ── Extractor endpoints (mod = custom | category) ─────────────────────────────
+@app.route("/api/states", methods=["GET"])
+def list_states():
+    """Canonical India state/UT names for the extractor's state filter."""
+    return jsonify({"states": STATE_NAMES})
+
+
 def _extractor_or_404(mod):
     cfg = EXTRACTORS.get(mod)
     return cfg
@@ -511,10 +572,13 @@ def ext_start(mod):
     if not is_all and (target is None or target <= 0):
         return jsonify({"error": "Enter a valid number of bids, or choose ALL."}), 400
 
+    states = _clean_states(data.get("states"))   # None = all states (no filter)
+
     ctrl.reset()
     ctrl.update(status="running", phase="collecting")
-    _save_meta(cfg, target, is_all)
-    t = threading.Thread(target=_run_extractor, args=(cfg, target, is_all, False))
+    _save_meta(cfg, target, is_all, states)
+    t = threading.Thread(target=_run_extractor, args=(cfg, target, is_all, False),
+                         kwargs={"states": states})
     t.daemon = True
     ctrl.thread = t
     t.start()
@@ -545,9 +609,11 @@ def ext_resume(mod):
     meta   = _load_meta(cfg)
     target = meta.get("target")
     is_all = meta.get("is_all", target is None)
+    states = _clean_states(meta.get("states"))
     ctrl.reset()
     ctrl.update(status="running", phase="collecting")
-    t = threading.Thread(target=_run_extractor, args=(cfg, target, is_all, True))
+    t = threading.Thread(target=_run_extractor, args=(cfg, target, is_all, True),
+                         kwargs={"states": states})
     t.daemon = True
     ctrl.thread = t
     t.start()

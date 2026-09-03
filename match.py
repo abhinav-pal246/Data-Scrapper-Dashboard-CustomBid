@@ -35,6 +35,37 @@ TFIDF_THRESHOLD     = 0.65
 EMBEDDING_THRESHOLD = 0.75
 MODEL_NAME          = "all-MiniLM-L6-v2"
 
+# ── Schema contract (confirmed against the live data, do not drift) ────────────
+#   CUSTOM QUERY TEXT               = "Item Category"       (buyer-authored free text)
+#   CATEGORY CORPUS                 = category_reference.csv → "Name"  (deduped)
+#   RELATED-CATEGORY (cross-check)  = "Relevant Categories" (buyer-selected GeM categories)
+#   GeMARPTS partition marker       = presence of the GeMARPTS-block columns below
+#
+# A CUSTOM bid exists only because the item is NOT a standard GeM category — the buyer
+# authors the Title/Specification themselves. A CATEGORY bid procures an item that already
+# exists as a standard GeM category. The ONLY reliable partition key is the GeMARPTS block:
+# custom-bid PDFs carry it, category PDFs do not (see gem_gemarpts_scraper.classify_and_extract,
+# which only emits a row when "GeMARPTS" is found). We do NOT rely on bid-number format.
+#
+# The buyer's "Relevant Categories" field is ALREADY a GeM category string (evidence: 136/200
+# of these values are verbatim category-master names). It must NEVER be used as the match
+# query: matching a GeM category against the GeM category master is a category-vs-category
+# comparison that trivially scores ~1.0 and proves nothing. It is kept ONLY as a cross-check
+# column in the output. The custom-side query text must always come from the buyer title.
+TITLE_COL            = "Item Category"          # ← the ONLY source of custom-side query text
+SPEC_COL             = "Specification"          # ← appended when present (absent in current schema)
+RELATED_COL          = "Relevant Categories"    # ← cross-check column only, NEVER the query
+CATEGORY_NAME_COL    = "Name"
+GEMARPTS_MARKER_COLS = ("Searched Strings", "Searched Result", "Relevant Categories")
+assert TITLE_COL != RELATED_COL, "config error: query column must not be the related-category column"
+
+# If more than this fraction of query texts are verbatim category-master names, the query is
+# almost certainly being drawn from a category-domain field (the exact leak we guard against),
+# so we refuse to run rather than silently ship a category-vs-category comparison.
+VERBATIM_LEAK_RATE   = 0.50
+REDFLAG_CSV          = "redflag_matches.csv"
+LAST_RUN_STATS       = {}       # populated by run_matching_job for callers/tests
+
 STOPWORDS = {
     "and", "or", "the", "for", "of", "in", "a", "an", "with",
     "to", "from", "by", "on", "at", "as", "is", "its", "are",
@@ -200,7 +231,17 @@ def load_categories(limit=None):
     seen                = set()
 
     with open(CATEGORY_CSV, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        # 6.1 (corpus side, structural): the category master must never carry the
+        # GeMARPTS-block columns that identify a custom bid — otherwise the corpus
+        # would contain custom-bid rows and the partition would leak.
+        leaked = [c for c in GEMARPTS_MARKER_COLS if c in (reader.fieldnames or [])]
+        if leaked:
+            raise ValueError(
+                f"PARTITION VIOLATION — category corpus {CATEGORY_CSV} carries GeMARPTS "
+                f"columns {leaked}; it must be a plain category master (e.g. {CATEGORY_NAME_COL},URL)."
+            )
+        for row in reader:
             name = (row.get("Name") or row.get("Category Name") or "").strip()
             url  = (row.get("URL") or "").strip()
             if not name or name in seen:
@@ -453,6 +494,101 @@ def _best_match_chunked(item_vectors, cat_matrix, threshold, always=False):
     return out
 
 
+# ── Partition & anti-leak guards (the core of the fix) ────────────────────────
+def _has_gemarpts(row):
+    """True iff the row carries GeMARPTS evidence (→ it is a Custom bid)."""
+    return any((row.get(c) or "").strip() for c in GEMARPTS_MARKER_COLS)
+
+
+def query_text(row):
+    """
+    The custom-side match text — the SINGLE source of truth for what gets matched.
+
+    Drawn ONLY from the buyer-authored Title (TITLE_COL) plus Specification when the
+    schema has one (SPEC_COL). NEVER from RELATED_COL. Every code path obtains its
+    query here so a future edit cannot silently swap in a category-domain field and
+    collapse the exercise into a category-vs-category match.
+    """
+    title = (row.get(TITLE_COL) or "").strip()
+    spec  = (row.get(SPEC_COL) or "").strip()   # not present in the current schema → ""
+    return f"{title} {spec}".strip() if spec else title
+
+
+def assert_query_partition(custom_rows):
+    """6.1 (query side): every query row must be a CUSTOM bid (GeMARPTS present)."""
+    bad = [(row.get("Bid No") or f"row#{i}")
+           for i, row in enumerate(custom_rows) if not _has_gemarpts(row)]
+    if bad:
+        raise ValueError(
+            f"PARTITION VIOLATION — {len(bad)}/{len(custom_rows)} query rows carry NO GeMARPTS "
+            f"marker {GEMARPTS_MARKER_COLS}; the query set must be CUSTOM bids only. "
+            f"Offenders: {bad[:10]}"
+        )
+
+
+def assert_corpus_partition(category_names):
+    """6.1 (corpus side): the corpus is the standard category master — no GeMARPTS."""
+    tainted = [c for c in category_names if "gemarpts" in c.lower()]
+    if tainted:
+        raise ValueError(
+            f"PARTITION VIOLATION — {len(tainted)} corpus entries look like GeMARPTS artifacts "
+            f"(e.g. {tainted[:3]}); the corpus must be the standard category master, not custom-bid rows."
+        )
+
+
+def _layer_short(verdict):
+    """Human-readable layer that produced an accepted match, from its verdict."""
+    return {"Strong match": "Layer 1 · fuzzy",
+            "Likely match": "Layer 2 · TF-IDF",
+            "Possible match": "Layer 3 · embedding"}.get(verdict, "—")
+
+
+def _write_redflag_csv(redflags, path=REDFLAG_CSV):
+    """Section 7: red-flag matches (custom bids that clear threshold against a category)."""
+    cols = ["custom_bid_id", "buyer_title", "matched_gem_category", "score", "match_layer",
+            "buyer_declared_related_category", "verbatim_flag"]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(redflags)
+
+
+def _print_validation_counts(stats):
+    """Section 6.4: loud, reproducible counts for every run."""
+    print("\n" + "─" * 60)
+    print("  VALIDATION SUMMARY (CUSTOM → CATEGORY partition)")
+    print("─" * 60)
+    print(f"  Total custom bids loaded        : {stats['total_custom_bids_loaded']}")
+    print(f"  Query set (custom, GeMARPTS+)   : {stats['query_set']}")
+    print(f"  Corpus size (unique categories) : {stats['corpus_size']}")
+    print(f"  Matches · Layer 1 fuzzy         : {stats['layer1_fuzzy']}")
+    print(f"  Matches · Layer 2 TF-IDF        : {stats['layer2_tfidf']}")
+    print(f"  Matches · Layer 3 embeddings    : {stats['layer3_embed']}")
+    print(f"  Weak / below threshold (gap)    : {stats['weak_below_threshold']}")
+    print(f"  RED-FLAG matches (≥ threshold)  : {stats['redflag_matches']}")
+    print(f"  ── watch buckets ──")
+    print(f"  Verbatim-category-title queries : {stats['verbatim_category_titles']}  "
+          f"(buyer titled the item exactly as an existing category)")
+    print(f"  Title == own declared related   : {stats['title_equals_own_related']}  "
+          f"(interesting, not a leak)")
+    print("─" * 60)
+
+
+def _print_sample_matches(results, k=20):
+    """Section 7: random samples so a human can eyeball L=custom free text, R=category."""
+    import random
+    pool = [r for r in results if r.get("Match Label") in
+            ("Strong match", "Likely match", "Possible match")] or results
+    sample = random.sample(pool, min(k, len(pool)))
+    print(f"\n  {min(k, len(pool))} random matches to eyeball "
+          f"(custom title  ➜  matched GeM category  [layer, score, verbatim]):")
+    for r in sample:
+        vb = " ⚠verbatim" if r.get("Verbatim Category Title") == "Yes" else ""
+        print(f"   • {(r.get('Item Category') or '')[:52]:<52} ➜ "
+              f"{(r.get('Matched Category') or '')[:52]:<52} "
+              f"[{r.get('Match Label')}, {r.get('Match Score')}{vb}]")
+
+
 def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
                      output_csv="compare_output.csv", progress=_noop,
                      custom_rows=None, checkpoint=_noop_cp):
@@ -483,23 +619,53 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
     custom_bids      = custom_rows if custom_rows is not None \
         else load_custom_bids(limit=custom_limit)
 
+    # ── Guardrails: enforce a clean CUSTOM → CATEGORY partition BEFORE matching ──
+    # (6.1) Every query row is a custom bid (GeMARPTS present); no corpus entry is.
+    assert_query_partition(custom_bids)
+    assert_corpus_partition(categories_original)
+    cat_norm_set = {_norm(c) for c in categories_original}   # for verbatim detection (6.3)
+
     # Carry over EVERY column from the Custom Bid Extractor output. Keep only
     # rows that actually carry an item, preserving order.
     DEFAULT_FIELDS = ["Bid No", "Item Category", "Searched Strings",
                       "Searched Result", "Relevant Categories"]
-    custom_fields = []
-    items = []   # list of (full_row, item_raw, item_clean)
+    custom_fields  = []
+    items          = []   # list of (full_row, item_raw, item_clean, verbatim_flag)
+    verbatim_ct    = 0    # buyer title is byte-identical (normalised) to a category name
+    own_related_ct = 0    # buyer title equals the buyer's OWN declared related category
     for row in custom_bids:
-        item_raw = (row.get("Item Category") or "").strip()
+        # (6.2) Query text comes ONLY from the buyer title via query_text() — never
+        # from RELATED_COL. This single call site is the guarded source of truth.
+        item_raw = query_text(row)
         if not item_raw:
             continue
         if not custom_fields:
             custom_fields = [k for k in row.keys() if k] or DEFAULT_FIELDS
-        items.append((row, item_raw, clean(item_raw)))
+        item_norm = _norm(item_raw)
+        vflag     = item_norm in cat_norm_set                       # (6.3)
+        if vflag:
+            verbatim_ct += 1
+        if item_norm and item_norm == _norm(row.get(RELATED_COL)):  # (6.4) watch bucket
+            own_related_ct += 1
+        items.append((row, item_raw, clean(item_raw), vflag))
     if not custom_fields:
         custom_fields = DEFAULT_FIELDS
 
     total = len(items)
+
+    # ── (6.2) Leak tripwire ───────────────────────────────────────────────────
+    # Buyer titles are free text: only a tiny fraction should ever be verbatim
+    # category names. If a large share are, the query is almost certainly being
+    # drawn from a category field (e.g. RELATED_COL) — refuse rather than ship a
+    # meaningless category-vs-category comparison.
+    if total and (verbatim_ct / total) > VERBATIM_LEAK_RATE:
+        raise ValueError(
+            f"LEAK TRIPWIRE — {verbatim_ct}/{total} ({verbatim_ct / total:.0%}) query texts are "
+            f"verbatim category-master names (> {VERBATIM_LEAK_RATE:.0%}). The custom-side query "
+            f"is almost certainly sourced from a category field (e.g. '{RELATED_COL}') instead of "
+            f"the buyer title '{TITLE_COL}'. Refusing to run a category-vs-category comparison."
+        )
+
     progress(phase="Matching", total=total, processed=0, matched=0)
 
     # match_info[i] = (matched_category_or_None, score, verdict, layer_label)
@@ -568,35 +734,71 @@ def run_matching_job(custom_limit=None, category_limit=None, compare_all=False,
     # that tier, so the highest matches appear at the top of both the dashboard
     # list and the downloaded CSV.
     progress(phase="Building results")
-    scored    = []
-    matched_n = 0
-    CONFIDENT = {"Strong match", "Likely match", "Possible match"}
-    TIER_RANK = {"Strong match": 4, "Likely match": 3, "Possible match": 2, "Weak (review)": 1}
-    for i, (row, item_raw, _clean) in enumerate(items):
+    scored     = []
+    redflags   = []       # confident matches only → the red-flag CSV (Section 7)
+    matched_n  = 0
+    layer_ct   = {"Strong match": 0, "Likely match": 0, "Possible match": 0, "Weak (review)": 0}
+    CONFIDENT  = {"Strong match", "Likely match", "Possible match"}
+    TIER_RANK  = {"Strong match": 4, "Likely match": 3, "Possible match": 2, "Weak (review)": 1}
+    for i, (row, item_raw, _clean, vflag) in enumerate(items):
         match, score, verdict, _layer = match_info[i]
-        if verdict in CONFIDENT:
-            matched_n += 1
+        layer_ct[verdict] = layer_ct.get(verdict, 0) + 1
         out = {k: (row.get(k, "") or "") for k in custom_fields}
-        out["Matched Category"] = match or "—"
-        out["Match Label"]      = verdict or "No match"
-        out["Match Score"]      = format_score(score, verdict)
+        out["Matched Category"]         = match or "—"
+        out["Match Label"]              = verdict or "No match"
+        out["Match Score"]              = format_score(score, verdict)
+        out["Verbatim Category Title"]  = "Yes" if vflag else "No"   # (6.3) cross-check flag
         # normalise the score to 0-100 (fuzzy is already 0-100; cosine is 0-1)
         norm = float(score) if verdict == "Strong match" else float(score) * 100.0
+        if verdict in CONFIDENT:
+            matched_n += 1
+            redflags.append({
+                "custom_bid_id":                   row.get("Bid No", "") or "",
+                "buyer_title":                     item_raw,
+                "matched_gem_category":            match or "",
+                "score":                           round(norm, 1),
+                "match_layer":                     _layer_short(verdict),
+                "buyer_declared_related_category": row.get(RELATED_COL, "") or "",  # cross-check
+                "verbatim_flag":                   "Yes" if vflag else "No",
+            })
         scored.append(((TIER_RANK.get(verdict, 0), norm), out))
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
     results = [out for _, out in scored]
 
-    # Always write the full CSV so the frontend can offer a download.
+    # Always write the full CSV so the frontend can offer a download. The new
+    # "Verbatim Category Title" column is additive; existing columns are unchanged.
     progress(phase="Writing CSV", processed=total, matched=matched_n)
-    fieldnames = custom_fields + ["Matched Category", "Match Label", "Match Score"]
+    fieldnames = custom_fields + ["Matched Category", "Match Label", "Match Score",
+                                  "Verbatim Category Title"]
     with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(results)
 
+    # Section 7: red-flag matches (custom bids that clear threshold against a category).
+    redflags.sort(key=lambda r: r["score"], reverse=True)
+    _write_redflag_csv(redflags, REDFLAG_CSV)
+
+    # Section 6.4: record + log the validation counts for every run.
+    global LAST_RUN_STATS
+    LAST_RUN_STATS = {
+        "total_custom_bids_loaded": len(custom_bids),
+        "query_set":                total,
+        "corpus_size":              len(categories_original),
+        "layer1_fuzzy":             layer_ct.get("Strong match", 0),
+        "layer2_tfidf":             layer_ct.get("Likely match", 0),
+        "layer3_embed":             layer_ct.get("Possible match", 0),
+        "weak_below_threshold":     layer_ct.get("Weak (review)", 0),
+        "redflag_matches":          len(redflags),
+        "verbatim_category_titles": verbatim_ct,
+        "title_equals_own_related": own_related_ct,
+    }
+    _print_validation_counts(LAST_RUN_STATS)
+
     print(f"Comparison: {total} custom bids vs {len(categories_original)} "
-          f"categories → {output_csv}  ({matched_n} confident matches)")
+          f"categories → {output_csv}  ({matched_n} confident matches, "
+          f"{len(redflags)} red flags → {REDFLAG_CSV})")
     return results
 
 
@@ -616,6 +818,10 @@ def run_matching():
     categories_clean = [clean(c) for c in categories_original]
     custom_bids      = load_custom_bids()
 
+    # Same partition guards as the batched path (6.1) — CUSTOM query set, CATEGORY corpus.
+    assert_query_partition(custom_bids)
+    assert_corpus_partition(categories_original)
+
     print("\nBuilding TF-IDF matrix...")
     vectorizer, tfidf_matrix = build_tfidf(categories_clean)
 
@@ -631,7 +837,7 @@ def run_matching():
 
     for i, row in enumerate(custom_bids, 1):
         bid_no   = (row.get("Bid No") or "").strip()
-        item_raw = (row.get("Item Category") or "").strip()
+        item_raw = query_text(row)      # (6.2) buyer title only — never RELATED_COL
 
         if not item_raw:
             continue
@@ -691,5 +897,30 @@ def run_matching():
     print(f"{'─'*55}\n")
 
 
+def validate(custom_limit=None, output_csv="compare_output.csv"):
+    """
+    Run the hardened CUSTOM → CATEGORY comparison over the full dataset and print
+    the Section-6 validation summary plus the Section-7 red-flag CSV, ending with
+    20 random sample matches to eyeball that the LEFT side is always custom free
+    text and the RIGHT side is always a GeM category.
+    """
+    results = run_matching_job(compare_all=True, custom_limit=custom_limit,
+                               output_csv=output_csv)
+    _print_sample_matches(results, k=20)
+    print(f"\n  Red-flag matches CSV : {REDFLAG_CSV}")
+    print(f"  Full comparison CSV  : {output_csv}\n")
+    return results
+
+
 if __name__ == "__main__":
-    run_matching()
+    import argparse
+    ap = argparse.ArgumentParser(description="GeM custom-bid → category matching (hardened).")
+    ap.add_argument("--legacy", action="store_true",
+                    help="run the old per-item CLI (writes match_output.csv) instead of validation")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="cap the number of custom bids (for a quick check)")
+    args = ap.parse_args()
+    if args.legacy:
+        run_matching()
+    else:
+        validate(custom_limit=args.limit)

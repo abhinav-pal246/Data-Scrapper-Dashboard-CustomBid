@@ -1,0 +1,6 @@
+﻿custom_bid_id,buyer_title,matched_gem_category,score,match_layer,buyer_declared_related_category,verbatim_flag
+GEM/2026/B/7753007,Database Management System Software,Database Management System Software (V3),93.3,Layer 1 · fuzzy,Database Management System Software (V3),No
+GEM/2026/B/7935748,Meat Dressed Frozen,Meat Dressed Frozen with Self Certification (Defence),80.8,Layer 3 · embedding,Meat Dressed Frozen with Self Certification (Defence),No
+GEM/2026/B/7662530,PVC Shoe Cover,PVC Shoe Cover (NPCIL),80.4,Layer 2 · TF-IDF,PVC Shoe Cover (NPCIL) Shoe Covers (Medical Use) ISI Marked to IS 17349,No
+GEM/2026/B/7683269,"5-1 2"" STAGE CEMENTING COLLAR , HYDRAULIC STAGE COLLAR 9 5 8"" BTC THREAD , Floating Equipment for Casing Pipes (ONGC)",Floating Equipment for Casing Pipes (ONGC),79.3,Layer 2 · TF-IDF,Fabricated PVC - U Fittings for Portable Water Supplies as per IS 10124,No
+GEM/2026/B/7644936,Supply of palladium on alumina (DeOxo) catalyst as per technical specification,Palladium on Alumina Catalyst,70.6,Layer 2 · TF-IDF,Palladium on Alumina Catalyst,No

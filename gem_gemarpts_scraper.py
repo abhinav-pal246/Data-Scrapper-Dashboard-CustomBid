@@ -453,11 +453,252 @@ def extract_full_text(pdf):
 
 
 # ----------------------------------------------------------------------------
+# State derivation (from the bid's Consignee / delivery address)
+# ----------------------------------------------------------------------------
+# GeM's listing carries no geographic state — only department/ministry. The one
+# place a location appears is the "Consignee → Address" table inside the bid PDF,
+# e.g. "…Jagdalpur, Dist.Bastar, CG 494001". We derive the state from that
+# address, in order of reliability: an explicit state NAME, then the 6-digit
+# PINCODE, then a 2-letter state CODE sitting right before the pincode.
+#
+# The pincode→state map is by postal circle (first 2-3 digits) and is
+# analytics-grade, not authoritative — a handful of pincodes near circle borders
+# can be attributed to a neighbouring state. Good enough for a state-wise
+# breakdown; not a substitute for the consignee's own declared address.
+
+# Full state / UT names (and common spellings) — matched first, most explicit.
+_STATE_NAME_ALIASES = {
+    "Andhra Pradesh": ["ANDHRA PRADESH"], "Arunachal Pradesh": ["ARUNACHAL PRADESH"],
+    "Assam": ["ASSAM"], "Bihar": ["BIHAR"],
+    "Chhattisgarh": ["CHHATTISGARH", "CHATTISGARH", "CHHATISGARH"],
+    "Goa": ["GOA"], "Gujarat": ["GUJARAT"], "Haryana": ["HARYANA"],
+    "Himachal Pradesh": ["HIMACHAL PRADESH", "HIMACHAL"], "Jharkhand": ["JHARKHAND"],
+    "Jammu and Kashmir": ["JAMMU AND KASHMIR", "JAMMU & KASHMIR", "JAMMU AND KASHMIR"],
+    "Karnataka": ["KARNATAKA"], "Kerala": ["KERALA"],
+    "Madhya Pradesh": ["MADHYA PRADESH"], "Maharashtra": ["MAHARASHTRA"],
+    "Manipur": ["MANIPUR"], "Meghalaya": ["MEGHALAYA"], "Mizoram": ["MIZORAM"],
+    "Nagaland": ["NAGALAND"], "Odisha": ["ODISHA", "ORISSA"], "Punjab": ["PUNJAB"],
+    "Rajasthan": ["RAJASTHAN"], "Sikkim": ["SIKKIM"],
+    "Tamil Nadu": ["TAMIL NADU", "TAMILNADU"], "Telangana": ["TELANGANA"],
+    "Tripura": ["TRIPURA"], "Uttar Pradesh": ["UTTAR PRADESH"],
+    "Uttarakhand": ["UTTARAKHAND", "UTTARANCHAL"], "West Bengal": ["WEST BENGAL"],
+    "Delhi": ["NEW DELHI", "DELHI"], "Ladakh": ["LADAKH"],
+    "Puducherry": ["PUDUCHERRY", "PONDICHERRY"], "Chandigarh": ["CHANDIGARH"],
+    "Andaman and Nicobar Islands": ["ANDAMAN AND NICOBAR", "ANDAMAN"],
+    "Dadra and Nagar Haveli and Daman and Diu": ["DADRA AND NAGAR HAVELI", "DAMAN AND DIU"],
+    "Lakshadweep": ["LAKSHADWEEP"],
+}
+
+# Canonical state / UT names the extractor can emit, for the UI state filter.
+# The dropdown must use these exact strings so a selected state matches what
+# derive_state() returns for a bid.
+STATE_NAMES = sorted(_STATE_NAME_ALIASES.keys())
+
+# 2-letter state codes as written in addresses (last-resort, only when hugging
+# the pincode, e.g. "CG 494001").
+_STATE_ABBR = {
+    "AP": "Andhra Pradesh", "AR": "Arunachal Pradesh", "AS": "Assam", "BR": "Bihar",
+    "CG": "Chhattisgarh", "CT": "Chhattisgarh", "GA": "Goa", "GJ": "Gujarat",
+    "HR": "Haryana", "HP": "Himachal Pradesh", "JH": "Jharkhand",
+    "JK": "Jammu and Kashmir", "KA": "Karnataka", "KL": "Kerala",
+    "MP": "Madhya Pradesh", "MH": "Maharashtra", "MN": "Manipur", "ML": "Meghalaya",
+    "MZ": "Mizoram", "NL": "Nagaland", "OD": "Odisha", "OR": "Odisha",
+    "PB": "Punjab", "RJ": "Rajasthan", "SK": "Sikkim", "TN": "Tamil Nadu",
+    "TS": "Telangana", "TG": "Telangana", "TR": "Tripura", "UP": "Uttar Pradesh",
+    "UK": "Uttarakhand", "UA": "Uttarakhand", "WB": "West Bengal", "DL": "Delhi",
+    "LA": "Ladakh", "AN": "Andaman and Nicobar Islands", "CH": "Chandigarh",
+    "PY": "Puducherry", "LD": "Lakshadweep",
+}
+
+# Pincode → state by first three digits (overrides), then first two (postal circle).
+_PIN3_STATE = {
+    "403": "Goa", "605": "Puducherry", "737": "Sikkim",
+    "744": "Andaman and Nicobar Islands",
+    "790": "Arunachal Pradesh", "791": "Arunachal Pradesh", "792": "Arunachal Pradesh",
+    "793": "Meghalaya", "794": "Meghalaya", "795": "Manipur", "796": "Mizoram",
+    "797": "Nagaland", "798": "Nagaland", "799": "Tripura",
+    "248": "Uttarakhand", "249": "Uttarakhand", "263": "Uttarakhand",
+}
+_PIN2_STATE = {
+    "11": "Delhi", "12": "Haryana", "13": "Haryana",
+    "14": "Punjab", "15": "Punjab", "16": "Punjab", "17": "Himachal Pradesh",
+    "18": "Jammu and Kashmir", "19": "Jammu and Kashmir",
+    "20": "Uttar Pradesh", "21": "Uttar Pradesh", "22": "Uttar Pradesh",
+    "23": "Uttar Pradesh", "24": "Uttar Pradesh", "25": "Uttar Pradesh",
+    "26": "Uttar Pradesh", "27": "Uttar Pradesh", "28": "Uttar Pradesh",
+    "30": "Rajasthan", "31": "Rajasthan", "32": "Rajasthan", "33": "Rajasthan",
+    "34": "Rajasthan", "36": "Gujarat", "37": "Gujarat", "38": "Gujarat",
+    "39": "Gujarat", "40": "Maharashtra", "41": "Maharashtra", "42": "Maharashtra",
+    "43": "Maharashtra", "44": "Maharashtra", "45": "Madhya Pradesh",
+    "46": "Madhya Pradesh", "47": "Madhya Pradesh", "48": "Madhya Pradesh",
+    "49": "Chhattisgarh", "50": "Telangana", "51": "Andhra Pradesh",
+    "52": "Andhra Pradesh", "53": "Andhra Pradesh", "56": "Karnataka",
+    "57": "Karnataka", "58": "Karnataka", "59": "Karnataka", "60": "Tamil Nadu",
+    "61": "Tamil Nadu", "62": "Tamil Nadu", "63": "Tamil Nadu", "64": "Tamil Nadu",
+    "65": "Tamil Nadu", "66": "Tamil Nadu", "67": "Kerala", "68": "Kerala",
+    "69": "Kerala", "70": "West Bengal", "71": "West Bengal", "72": "West Bengal",
+    "73": "West Bengal", "74": "West Bengal", "75": "Odisha", "76": "Odisha",
+    "77": "Odisha", "78": "Assam", "80": "Bihar", "81": "Jharkhand",
+    "82": "Jharkhand", "83": "Jharkhand", "84": "Bihar", "85": "Bihar",
+}
+# Major cities / district HQs → state. Used as a last resort, mainly for bids
+# where GeM masks the address (e.g. "***********HYDERABAD") so the pincode is
+# hidden but the city name survives. Not exhaustive; covers the common ones.
+_CITY_STATE = {
+    "HYDERABAD": "Telangana", "WARANGAL": "Telangana", "NIZAMABAD": "Telangana",
+    "KARIMNAGAR": "Telangana", "SECUNDERABAD": "Telangana",
+    "VISAKHAPATNAM": "Andhra Pradesh", "VIJAYAWADA": "Andhra Pradesh",
+    "GUNTUR": "Andhra Pradesh", "TIRUPATI": "Andhra Pradesh", "NELLORE": "Andhra Pradesh",
+    "AMARAVATI": "Andhra Pradesh", "KAKINADA": "Andhra Pradesh",
+    "MUMBAI": "Maharashtra", "PUNE": "Maharashtra", "NAGPUR": "Maharashtra",
+    "NASHIK": "Maharashtra", "AURANGABAD": "Maharashtra", "THANE": "Maharashtra",
+    "SOLAPUR": "Maharashtra", "KOLHAPUR": "Maharashtra", "AMRAVATI": "Maharashtra",
+    "NAVI MUMBAI": "Maharashtra", "PANVEL": "Maharashtra",
+    "BENGALURU": "Karnataka", "BANGALORE": "Karnataka", "MYSURU": "Karnataka",
+    "MYSORE": "Karnataka", "HUBBALLI": "Karnataka", "HUBLI": "Karnataka",
+    "MANGALURU": "Karnataka", "MANGALORE": "Karnataka", "BELAGAVI": "Karnataka",
+    "KALABURAGI": "Karnataka", "GULBARGA": "Karnataka",
+    "CHENNAI": "Tamil Nadu", "COIMBATORE": "Tamil Nadu", "MADURAI": "Tamil Nadu",
+    "TIRUCHIRAPPALLI": "Tamil Nadu", "TRICHY": "Tamil Nadu", "SALEM": "Tamil Nadu",
+    "TIRUNELVELI": "Tamil Nadu", "ERODE": "Tamil Nadu", "VELLORE": "Tamil Nadu",
+    "THIRUVANANTHAPURAM": "Kerala", "TRIVANDRUM": "Kerala", "KOCHI": "Kerala",
+    "COCHIN": "Kerala", "KOZHIKODE": "Kerala", "CALICUT": "Kerala",
+    "THRISSUR": "Kerala", "KOLLAM": "Kerala", "KANNUR": "Kerala",
+    "KOLKATA": "West Bengal", "HOWRAH": "West Bengal", "SILIGURI": "West Bengal",
+    "DURGAPUR": "West Bengal", "ASANSOL": "West Bengal", "KHARAGPUR": "West Bengal",
+    "BHUBANESWAR": "Odisha", "CUTTACK": "Odisha", "ROURKELA": "Odisha",
+    "SAMBALPUR": "Odisha", "BERHAMPUR": "Odisha", "PURI": "Odisha",
+    "PATNA": "Bihar", "GAYA": "Bihar", "BHAGALPUR": "Bihar", "MUZAFFARPUR": "Bihar",
+    "DARBHANGA": "Bihar", "PURNIA": "Bihar",
+    "RANCHI": "Jharkhand", "JAMSHEDPUR": "Jharkhand", "DHANBAD": "Jharkhand",
+    "BOKARO": "Jharkhand", "HAZARIBAGH": "Jharkhand",
+    "LUCKNOW": "Uttar Pradesh", "KANPUR": "Uttar Pradesh", "AGRA": "Uttar Pradesh",
+    "VARANASI": "Uttar Pradesh", "PRAYAGRAJ": "Uttar Pradesh", "ALLAHABAD": "Uttar Pradesh",
+    "MEERUT": "Uttar Pradesh", "GHAZIABAD": "Uttar Pradesh", "NOIDA": "Uttar Pradesh",
+    "BAREILLY": "Uttar Pradesh", "GORAKHPUR": "Uttar Pradesh", "ALIGARH": "Uttar Pradesh",
+    "JAIPUR": "Rajasthan", "JODHPUR": "Rajasthan", "UDAIPUR": "Rajasthan",
+    "KOTA": "Rajasthan", "AJMER": "Rajasthan", "BIKANER": "Rajasthan",
+    "BHOPAL": "Madhya Pradesh", "INDORE": "Madhya Pradesh", "GWALIOR": "Madhya Pradesh",
+    "JABALPUR": "Madhya Pradesh", "UJJAIN": "Madhya Pradesh", "SAGAR": "Madhya Pradesh",
+    "RAIPUR": "Chhattisgarh", "BHILAI": "Chhattisgarh", "BILASPUR": "Chhattisgarh",
+    "KORBA": "Chhattisgarh", "JAGDALPUR": "Chhattisgarh",
+    "AHMEDABAD": "Gujarat", "SURAT": "Gujarat", "VADODARA": "Gujarat",
+    "RAJKOT": "Gujarat", "BHAVNAGAR": "Gujarat", "GANDHINAGAR": "Gujarat",
+    "JAMNAGAR": "Gujarat",
+    "GURUGRAM": "Haryana", "GURGAON": "Haryana", "FARIDABAD": "Haryana",
+    "PANIPAT": "Haryana", "AMBALA": "Haryana", "HISAR": "Haryana", "KARNAL": "Haryana",
+    "ROHTAK": "Haryana",
+    "LUDHIANA": "Punjab", "AMRITSAR": "Punjab", "JALANDHAR": "Punjab",
+    "PATIALA": "Punjab", "BATHINDA": "Punjab", "MOHALI": "Punjab",
+    "SHIMLA": "Himachal Pradesh", "DHARAMSHALA": "Himachal Pradesh", "MANDI": "Himachal Pradesh",
+    "SOLAN": "Himachal Pradesh",
+    "SRINAGAR": "Jammu and Kashmir", "JAMMU": "Jammu and Kashmir",
+    "LEH": "Ladakh",
+    "DEHRADUN": "Uttarakhand", "HARIDWAR": "Uttarakhand", "HALDWANI": "Uttarakhand",
+    "RUDRAPUR": "Uttarakhand", "ROORKEE": "Uttarakhand", "NAINITAL": "Uttarakhand",
+    "GUWAHATI": "Assam", "DIBRUGARH": "Assam", "SILCHAR": "Assam", "JORHAT": "Assam",
+    "TEZPUR": "Assam",
+    "ITANAGAR": "Arunachal Pradesh", "SHILLONG": "Meghalaya", "IMPHAL": "Manipur",
+    "AIZAWL": "Mizoram", "KOHIMA": "Nagaland", "DIMAPUR": "Nagaland",
+    "AGARTALA": "Tripura", "GANGTOK": "Sikkim",
+    "PANAJI": "Goa", "PANJIM": "Goa", "MARGAO": "Goa", "VASCO": "Goa",
+    "CHANDIGARH": "Chandigarh", "PUDUCHERRY": "Puducherry", "PONDICHERRY": "Puducherry",
+    "PORT BLAIR": "Andaman and Nicobar Islands",
+    "NEW DELHI": "Delhi", "DELHI": "Delhi",
+}
+# Match multi-word cities before their single-word substrings.
+_CITY_STATE_ORDERED = sorted(_CITY_STATE, key=len, reverse=True)
+
+_PINCODE_RE = re.compile(r"\b(\d{6})\b")
+
+
+def _pin_to_state(pincode):
+    """Map a 6-digit pincode to a state (3-digit override, then 2-digit circle)."""
+    if not pincode or len(pincode) != 6:
+        return ""
+    return _PIN3_STATE.get(pincode[:3]) or _PIN2_STATE.get(pincode[:2], "")
+
+
+def derive_state(address_text):
+    """
+    Best-effort state from a consignee/address string:
+    explicit state name → pincode → 2-letter code before the pincode. "" if none.
+    """
+    if not address_text:
+        return ""
+    text  = str(address_text)
+    upper = text.upper()
+
+    # 1. Explicit state / UT name (word-boundary match).
+    for state, aliases in _STATE_NAME_ALIASES.items():
+        for alias in aliases:
+            if re.search(r"\b" + re.escape(alias) + r"\b", upper):
+                return state
+
+    # 2. Pincode → postal circle.
+    m = _PINCODE_RE.search(text)
+    if m:
+        st = _pin_to_state(m.group(1))
+        if st:
+            return st
+
+    # 3. A 2-letter code hugging the pincode, e.g. "CG 494001" / "CG-494001".
+    m = re.search(r"\b([A-Z]{2})\b[\s,\-]*\d{6}", upper)
+    if m and m.group(1) in _STATE_ABBR:
+        return _STATE_ABBR[m.group(1)]
+
+    # 4. A known city / district HQ (mainly for masked addresses like
+    #    "***********HYDERABAD" where the pincode is redacted). Longest names
+    #    first so "NAVI MUMBAI" wins over "MUMBAI", "NEW DELHI" over "DELHI".
+    for city in _CITY_STATE_ORDERED:
+        if re.search(r"\b" + re.escape(city) + r"\b", upper):
+            return _CITY_STATE[city]
+    return ""
+
+
+# Consignee/address table header cues.
+_CONSIGNEE_HDR_RE = re.compile(r"consignee|reporting", re.IGNORECASE)
+_ADDRESS_HDR_RE   = re.compile(r"address", re.IGNORECASE)
+
+
+def extract_consignee_state(pdf):
+    """
+    Derive the buyer/consignee state from the first Consignee→Address row of the
+    bid PDF. Falls back to scanning any address-like text with a pincode.
+    Returns a state name or "" when it can't be determined.
+    """
+    # Preferred: the Consignee/Address table — read the address cell of row 1.
+    for page in pdf.pages:
+        for table in page.extract_tables():
+            if not table or len(table) < 2:
+                continue
+            header = " ".join((c or "") for c in table[0])
+            if not (_CONSIGNEE_HDR_RE.search(header) and _ADDRESS_HDR_RE.search(header)):
+                continue
+            for row in table[1:]:
+                # Derive from the whole row: the address may be masked
+                # ("***********HYDERABAD") so the city — not a pincode — is the
+                # only signal left, and derive_state handles both.
+                joined = " ".join((c or "").replace("\n", " ") for c in row)
+                st = derive_state(joined)
+                if st:
+                    return st
+    # Fallback: first address-like line anywhere in the document text.
+    text = extract_full_text(pdf)
+    for line in (text or "").splitlines():
+        if _PINCODE_RE.search(line):
+            st = derive_state(line)
+            if st:
+                return st
+    return ""
+
+
+# ----------------------------------------------------------------------------
 # PILLAR 6 : CSV
 # ----------------------------------------------------------------------------
 
 CSV_HEADER = ["Bid No", "Item Category", "Searched Strings",
-              "Searched Result", "Relevant Categories", "Department"]
+              "Searched Result", "Relevant Categories", "Department", "State"]
 
 
 def load_processed_bids(csv_path):
@@ -478,7 +719,7 @@ def append_row(csv_path, row):
             w.writerow(CSV_HEADER)
         w.writerow([row["bid_no"], row["item_category"], row["searched_strings"],
                     row["searched_result"], row["relevant_categories"],
-                    row.get("department", "")])
+                    row.get("department", ""), row.get("state", "")])
         w.writerow([])
 
 
@@ -538,6 +779,7 @@ def process_one(session, bid_no, doc_id):
             log_failure(bid_no or "?", doc_id, "no text layer (scanned, needs OCR)")
             return None
         fields = extract_fields(pdf)
+        state  = extract_consignee_state(pdf)   # buyer/consignee delivery state
 
     resolved = bid_no or (BID_NO_RE.search(text).group(0)
                           if BID_NO_RE.search(text) else doc_id)
@@ -546,7 +788,7 @@ def process_one(session, bid_no, doc_id):
         log_failure(resolved, doc_id, "no GeMARPTS fields found")
         return None
 
-    return {"bid_no": resolved, **fields}
+    return {"bid_no": resolved, "state": state, **fields}
 
 
 def debug_listing(session):

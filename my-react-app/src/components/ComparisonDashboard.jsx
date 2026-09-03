@@ -5,15 +5,6 @@ const API = ""; // same-origin; Vite proxies /api -> Flask (see vite.config.js)
 const CONFIDENT = ["Strong match", "Likely match", "Possible match"];
 const isConfident = (row) => CONFIDENT.includes(row["Match Label"]);
 
-function verdictStyle(row) {
-  const label = row["Match Label"] || "";
-  if (label === "Strong match")   return "text-gem-green bg-green-50 border-green-300";
-  if (label === "Likely match")   return "text-gem-blue bg-blue-50 border-blue-200";
-  if (label === "Possible match") return "text-purple-700 bg-purple-50 border-purple-200";
-  if (label.startsWith("Weak"))   return "text-amber-700 bg-amber-50 border-amber-300";
-  return "text-gem-muted bg-slate-100 border-gem-border";
-}
-
 // ── Department insights ───────────────────────────────────────────────────────
 // A Custom Bid is treated as "avoidable" when it matches an existing Category
 // Bid at or above this score, i.e. a suitable Category Bid was already available.
@@ -49,11 +40,83 @@ function analyze(rows) {
   return { total, avoidableCount: avoidable.length, deptCount: byDept.length, byDept, avoidable };
 }
 
+// ── Department usage drill-down ────────────────────────────────────────────────
+// Every department that raised Custom Bids, ranked by how many it raised, with
+// each bid's closest existing Category Bid and the similarity to it. Powers the
+// "Top Departments" view — the master list plus each department's detail.
+function departmentUsage(rows) {
+  const map = {};   // department -> { dept, count, withCategory, bids: [] }
+
+  for (const r of rows) {
+    const dept = (r["Department"] || "").trim() || "Unspecified department";
+    if (!map[dept]) map[dept] = { dept, count: 0, withCategory: 0, bids: [] };
+
+    const score     = parseFloat(r["Match Score"]);          // reads "76%" and "91.0 / 100"
+    const category  = r["Matched Category"];
+    const hasCat     = !!category && category !== "—";
+    // A "similar category already exists under Category Bids" when the matcher
+    // cleared its confidence bar (Strong / Likely / Possible). A Weak result is
+    // the nearest category but below confidence — treated as no close category.
+    const confident = isConfident(r);
+
+    map[dept].count++;
+    if (confident) map[dept].withCategory++;
+    map[dept].bids.push({
+      bidNo:    r["Bid No"] || "—",
+      item:     r["Item Category"] || "—",
+      category: hasCat ? category : null,
+      score:    isNaN(score) ? null : Math.round(score),
+      confident,
+      label:    r["Match Label"] || "",
+      state:    rowState(r),
+    });
+  }
+
+  const list = Object.values(map).sort(
+    (a, b) => b.count - a.count || a.dept.localeCompare(b.dept));
+  // Within a department, surface the bids that had a category available first,
+  // then by similarity descending.
+  for (const d of list)
+    d.bids.sort((a, b) => (b.confident - a.confident) || ((b.score || 0) - (a.score || 0)));
+  return list;
+}
+
+// Colour an indicator on a red→green scale: RED for the HIGHEST value, transitioning
+// to GREEN for the LOWEST. Used for both match counts (Top Departments) and match
+// scores (Comparison List). Returns inline style so the transition is smooth across
+// the full range (not fixed Tailwind buckets). Non-numeric values get a neutral grey.
+function heatStyle(value, min, max) {
+  if (!Number.isFinite(value))
+    return { color: "#64748b", backgroundColor: "#f1f5f9", borderColor: "#e2e8f0" };
+  const t   = max > min ? (value - min) / (max - min) : 0.5; // 1 = highest, 0 = lowest
+  const hue = Math.round(120 * (1 - t));                     // 0 = red (highest) … 120 = green (lowest)
+  return {
+    color:           `hsl(${hue}, 68%, 32%)`,
+    backgroundColor: `hsl(${hue}, 80%, 95%)`,
+    borderColor:     `hsl(${hue}, 60%, 78%)`,
+  };
+}
+
 // ── Supporting analyses ───────────────────────────────────────────────────────
 const _normText = (s) => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 // Significant word tokens: drop short words and standalone numbers so that bids
 // differing only in numeric spec values are still recognised as similar wording.
 const _wordTokens = (s) => _normText(s).split(" ").filter((w) => w.length > 2 && !/^\d+$/.test(w));
+
+// State the custom bid was raised from (buyer/consignee delivery state),
+// derived by the extractor from the bid's consignee address.
+const rowState = (r) => (r["State"] || "").trim() || "Unknown";
+
+// State-wise distribution: how many custom bids came from each state.
+function stateDistribution(rows) {
+  const counts = {};
+  for (const r of rows) counts[rowState(r)] = (counts[rowState(r)] || 0) + 1;
+  return Object.entries(counts)
+    .map(([state, count]) => ({ state, count }))
+    // Real states first (alphabetical), "Unknown" always last.
+    .sort((a, b) =>
+      a.state === "Unknown" ? 1 : b.state === "Unknown" ? -1 : b.count - a.count);
+}
 
 // Category Activity: categories that repeatedly attract Custom Bids.
 function categoryActivity(rows) {
@@ -83,6 +146,7 @@ function similarityGroups(rows) {
       bidNo: r["Bid No"] || "—",
       item: r["Item Category"] || "—",
       dept: (r["Department"] || "").trim() || "Unspecified department",
+      state: rowState(r),
     });
   }
   return Object.values(sig).filter((g) => g.length >= 2).sort((a, b) => b.length - a.length);
@@ -115,6 +179,7 @@ function specificationFlags(rows) {
       bidNo: r["Bid No"] || "—",
       item,
       dept: (r["Department"] || "").trim() || "Unspecified department",
+      state: rowState(r),
       reasons,
       weight: signals.length * 10 + numTokens + (item.length > 160 ? 5 : 0),
     });
@@ -126,6 +191,10 @@ function ResultsVisualizer({ rows }) {
   const { total, avoidableCount, deptCount, byDept, avoidable } = analyze(rows);
   const maxDept = byDept.length ? byDept[0].count : 1;
   const pct = total ? Math.round((avoidableCount / total) * 100) : 0;
+  // Red (highest match) → green (lowest match) for the score column.
+  const _av   = avoidable.map((a) => a.score);
+  const avLo  = _av.length ? Math.min(..._av) : 0;
+  const avHi  = _av.length ? Math.max(..._av) : 0;
 
   return (
     <div className="space-y-4">
@@ -214,7 +283,7 @@ function ResultsVisualizer({ rows }) {
                       <td className="font-mono text-xs text-gem-blue whitespace-nowrap">{a.bidNo}</td>
                       <td className="text-gem-text max-w-xs">{a.item}</td>
                       <td className="text-gem-text max-w-xs">{a.category}</td>
-                      <td className="text-right font-semibold text-gem-green tabular-nums">{a.score}%</td>
+                      <td className="text-right font-semibold tabular-nums" style={{ color: heatStyle(a.score, avLo, avHi).color }}>{a.score}%</td>
                     </tr>
                   ))}
                 </tbody>
@@ -229,13 +298,94 @@ function ResultsVisualizer({ rows }) {
 
 // ── Analysis view (separate tab): category activity, similarity, specifications ─
 function AnalysisView({ rows }) {
-  const catActivity = categoryActivity(rows);
-  const simGroups   = similarityGroups(rows);
-  const specFlags   = specificationFlags(rows);
+  const [stateFilter, setStateFilter] = useState("all");
+
+  // State distribution over ALL rows (so the filter always lists every state),
+  // and whether any state was actually derived (older extractions won't have it).
+  const stateDist    = stateDistribution(rows);
+  const hasStateData = stateDist.some((s) => s.state !== "Unknown");
+  const maxState     = stateDist.length ? Math.max(...stateDist.map((s) => s.count)) : 1;
+
+  // Everything below the state card reflects the selected state.
+  const scoped = stateFilter === "all" ? rows : rows.filter((r) => rowState(r) === stateFilter);
+
+  const catActivity = categoryActivity(scoped);
+  const simGroups   = similarityGroups(scoped);
+  const specFlags   = specificationFlags(scoped);
   const maxCat      = catActivity.length ? catActivity[0].count : 1;
 
   return (
     <div className="space-y-4">
+      {/* State-wise distribution + filter */}
+      <div className="gem-card overflow-hidden">
+        <div className="gem-card-pad pb-3 flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-gem-text">State-wise distribution</h3>
+            <p className="text-sm text-gem-muted mt-1">
+              The state each custom bid was raised from, derived from its consignee (delivery) address.
+              Use the filter to scope the analyses below to a single state.
+            </p>
+          </div>
+          <label className="flex items-center gap-2 text-sm whitespace-nowrap">
+            <span className="text-gem-muted">State</span>
+            <select
+              value={stateFilter}
+              onChange={(e) => setStateFilter(e.target.value)}
+              className="gem-input py-1.5 pr-8"
+            >
+              <option value="all">All states ({rows.length.toLocaleString()})</option>
+              {stateDist.map(({ state, count }) => (
+                <option key={state} value={state}>{state} ({count.toLocaleString()})</option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {!hasStateData ? (
+          <p className="gem-card-pad pt-0 text-sm text-gem-text">
+            No state information is available for these results. State is derived during extraction from
+            each bid’s consignee address — run a fresh comparison to populate it.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="gem-table">
+              <thead>
+                <tr>
+                  <th>State</th>
+                  <th className="text-right whitespace-nowrap">Custom Bids</th>
+                  <th className="w-2/5">Relative share</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stateDist.map(({ state, count }) => (
+                  <tr
+                    key={state}
+                    onClick={() => setStateFilter((f) => (f === state ? "all" : state))}
+                    className={`cursor-pointer hover:bg-slate-50 ${stateFilter === state ? "bg-blue-50" : ""}`}
+                  >
+                    <td className={`text-gem-text ${state === "Unknown" ? "italic text-gem-muted" : ""}`}>{state}</td>
+                    <td className="text-right font-semibold text-gem-text tabular-nums">{count.toLocaleString()}</td>
+                    <td>
+                      <div className="bg-slate-100 rounded h-2.5 overflow-hidden">
+                        <div className="bg-gem-blue h-2.5" style={{ width: `${Math.round((count / maxState) * 100)}%` }} />
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {stateFilter !== "all" && (
+        <div className="flex items-center gap-2 text-sm text-gem-text">
+          <span className="gem-badge text-gem-blue bg-blue-50 border-blue-200">
+            Filtered to {stateFilter} · {scoped.length.toLocaleString()} bids
+          </span>
+          <button onClick={() => setStateFilter("all")} className="text-gem-link underline text-xs">Clear filter</button>
+        </div>
+      )}
       {/* Category Activity Analysis */}
       <div className="gem-card overflow-hidden">
         <div className="gem-card-pad pb-3">
@@ -298,6 +448,7 @@ function AnalysisView({ rows }) {
                       <span className="font-mono text-gem-blue">{b.bidNo}</span>
                       <span className="text-gem-text">{b.item}</span>
                       <span className="text-gem-muted">{b.dept}</span>
+                      <span className="text-gem-muted">· {b.state}</span>
                     </div>
                   ))}
                 </div>
@@ -323,12 +474,13 @@ function AnalysisView({ rows }) {
           <div className="overflow-auto max-h-[60vh]">
             <table className="gem-table">
               <thead className="sticky top-0 z-10">
-                <tr><th>Custom Bid No</th><th>Department</th><th>Custom Item</th><th>Observation</th></tr>
+                <tr><th>Custom Bid No</th><th>State</th><th>Department</th><th>Custom Item</th><th>Observation</th></tr>
               </thead>
               <tbody>
                 {specFlags.slice(0, 25).map((f, i) => (
                   <tr key={i}>
                     <td className="font-mono text-xs text-gem-blue whitespace-nowrap">{f.bidNo}</td>
+                    <td className="text-gem-text text-xs whitespace-nowrap">{f.state}</td>
                     <td className="text-gem-text text-xs">{f.dept}</td>
                     <td className="text-gem-text max-w-xs">{f.item}</td>
                     <td>
@@ -349,6 +501,210 @@ function AnalysisView({ rows }) {
           </p>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Top Departments view: top 10 orgs by Custom Bid usage, with drill-down ──────
+function DepartmentDetail({ dept }) {
+  const withCat = dept.withCategory;
+
+  return (
+    <div className="gem-card overflow-hidden">
+      <div className="gem-card-pad pb-3">
+        <h3 className="text-base font-semibold text-gem-text">{dept.dept}</h3>
+        <p className="text-sm text-gem-muted mt-1 leading-relaxed">
+          Every Custom Bid this department raised — the buyer’s stated requirement, whether the item was
+          already available as a Category Bid, and the matching category where one exists.
+        </p>
+        <div className="flex flex-wrap gap-x-10 gap-y-3 mt-4">
+          <div>
+            <p className="text-2xl font-bold text-gem-text tabular-nums">{dept.count.toLocaleString()}</p>
+            <p className="text-xs text-gem-muted">Custom Bids raised</p>
+          </div>
+          {withCat > 0 && (
+            <div>
+              <p className="text-2xl font-bold text-amber-600 tabular-nums">{withCat.toLocaleString()}</p>
+              <p className="text-xs text-gem-muted">had a matching Category Bid available</p>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="overflow-auto max-h-[60vh]">
+        <table className="gem-table">
+          <thead className="sticky top-0 z-10">
+            <tr>
+              <th>Custom Bid No</th>
+              <th>Buyer’s requirement / custom description</th>
+              <th className="whitespace-nowrap">Bid type</th>
+              <th>Matching category</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dept.bids.map((b, i) => (
+              <tr key={i}>
+                <td className="font-mono text-xs text-gem-blue whitespace-nowrap align-top">{b.bidNo}</td>
+                <td className="text-gem-text align-top max-w-md">{b.item}</td>
+                <td className="whitespace-nowrap align-top">
+                  {b.confident ? (
+                    <span className="gem-badge text-amber-700 bg-amber-50 border-amber-300">Category Bid available</span>
+                  ) : (
+                    <span className="gem-badge text-gem-muted bg-slate-100 border-gem-border">Custom Bid</span>
+                  )}
+                </td>
+                <td className="text-gem-text align-top max-w-xs">
+                  {b.confident && b.category ? (
+                    <span>
+                      {b.category}
+                      {b.score != null && <span className="text-gem-muted"> · {b.score}% match</span>}
+                    </span>
+                  ) : (
+                    <span className="text-gem-muted">—</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function TopDepartmentsView({ rows }) {
+  const depts    = departmentUsage(rows);
+  const top      = depts.slice(0, 10);
+  // Open the busiest department by default so the drill-down is never empty.
+  const [selected, setSelected] = useState(top.length ? top[0].dept : null);
+  const active = depts.find((d) => d.dept === selected) || null;
+
+  // Departments that had a matching Category Bid available yet still raised a
+  // Custom Bid — ranked by how many category matches they had (most first, down
+  // to 1). Each keeps only its matched bids (category + buyer's description).
+  const flagged = depts
+    .filter((d) => d.withCategory > 0)
+    .map((d) => ({ ...d, matched: d.bids.filter((b) => b.confident) }))
+    .sort((a, b) =>
+      b.withCategory - a.withCategory || b.count - a.count || a.dept.localeCompare(b.dept));
+
+  // Range of category-match counts, for the red (most) → green (fewest) indicator.
+  const _mc      = flagged.map((d) => d.withCategory);
+  const minMatch = _mc.length ? Math.min(..._mc) : 0;
+  const maxMatch = _mc.length ? Math.max(..._mc) : 0;
+
+  if (!depts.length) {
+    return (
+      <div className="gem-card gem-card-pad">
+        <p className="text-sm text-gem-text">No departments were found in these results.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Master list */}
+      <div className="gem-card overflow-hidden">
+        <div className="gem-card-pad pb-3">
+          <h3 className="text-base font-semibold text-gem-text">Top departments by Custom Bid usage</h3>
+          <p className="text-sm text-gem-muted mt-1 leading-relaxed">
+            The ten departments and organisations that raised the most Custom Bids. Select a department to see
+            each bid — the buyer’s stated requirement, whether the item was already available as a Category Bid,
+            and the matching category where one exists.
+          </p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="gem-table">
+            <thead>
+              <tr>
+                <th className="w-8">#</th>
+                <th>Department / Organisation</th>
+                <th className="text-right whitespace-nowrap">Custom Bids</th>
+                <th className="text-right whitespace-nowrap">Category Bid available</th>
+              </tr>
+            </thead>
+            <tbody>
+              {top.map((d, i) => (
+                <tr
+                  key={d.dept}
+                  onClick={() => setSelected((s) => (s === d.dept ? null : d.dept))}
+                  className={`cursor-pointer hover:bg-slate-50 ${selected === d.dept ? "bg-blue-50" : ""}`}
+                >
+                  <td className="text-gem-muted tabular-nums">{i + 1}</td>
+                  <td className="text-gem-text">{d.dept}</td>
+                  <td className="text-right font-semibold text-gem-text tabular-nums">{d.count.toLocaleString()}</td>
+                  <td className="text-right tabular-nums">
+                    {d.withCategory > 0 ? (
+                      <span className="font-semibold"
+                            style={{ color: heatStyle(d.withCategory, minMatch, maxMatch).color }}>
+                        {d.withCategory.toLocaleString()}
+                        <span className="text-gem-muted font-normal"> / {d.count.toLocaleString()}</span>
+                      </span>
+                    ) : (
+                      <span className="text-gem-muted">—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Selected department drill-down */}
+      {active && <DepartmentDetail dept={active} />}
+
+      {/* Departments that bypassed an available category (ranked by match count) */}
+      {flagged.length > 0 && (
+        <div className="gem-card overflow-hidden">
+          <div className="gem-card-pad pb-3">
+            <h3 className="text-base font-semibold text-gem-text">
+              Custom Bids raised despite an available category
+            </h3>
+            <p className="text-sm text-gem-muted mt-1 leading-relaxed">
+              Departments that already had a matching GeM category yet still raised a Custom Bid, ranked by the
+              number of category matches (most first). For each, the matching category and the buyer’s stated
+              requirement are shown.
+            </p>
+          </div>
+          <div className="gem-card-pad pt-0 space-y-4">
+            {flagged.map((d) => (
+              <div key={d.dept} className="border border-gem-border rounded-md overflow-hidden">
+                <div className="flex items-center justify-between gap-3 px-3 py-2 bg-slate-50 border-b border-gem-border">
+                  <span className="text-sm font-semibold text-gem-text">{d.dept}</span>
+                  <span className="gem-badge whitespace-nowrap"
+                        style={heatStyle(d.withCategory, minMatch, maxMatch)}>
+                    {d.withCategory} category {d.withCategory === 1 ? "match" : "matches"}
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="gem-table">
+                    <thead>
+                      <tr>
+                        <th>Custom Bid No</th>
+                        <th>Matching category</th>
+                        <th>Buyer’s custom description / reason</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {d.matched.map((b, i) => (
+                        <tr key={i}>
+                          <td className="font-mono text-xs text-gem-blue whitespace-nowrap align-top">{b.bidNo}</td>
+                          <td className="text-gem-text align-top max-w-xs">
+                            {b.category}
+                            {b.score != null && <span className="text-gem-muted"> · {b.score}% match</span>}
+                          </td>
+                          <td className="text-gem-text align-top max-w-md">{b.item}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
@@ -473,6 +829,12 @@ export default function ComparisonDashboard() {
   const confidentCount = result?.rows ? result.rows.filter(isConfident).length : null;
   const weakCount = result?.rows ? result.rows.filter((r) => !isConfident(r) && r["Matched Category"] !== "—").length : null;
 
+  // Score range across the current results — drives the red (highest match) → green
+  // (lowest match) colour of the Match Label and Score in the Comparison List.
+  const _listScores = result?.rows ? result.rows.map((r) => parseFloat(r["Match Score"])).filter(Number.isFinite) : [];
+  const loScore = _listScores.length ? Math.min(..._listScores) : 0;
+  const hiScore = _listScores.length ? Math.max(..._listScores) : 0;
+
   const aj = phase === "extract" ? extractJob : job;
   const ajStatus = aj?.status;
   const extractPct = extractJob?.total > 0 ? Math.round((extractJob.written / extractJob.total) * 100) : 0;
@@ -517,11 +879,18 @@ export default function ComparisonDashboard() {
           {status === "running" ? (phase === "extract" ? "Extracting custom bids" : "Matching") : "Extract and Run Comparison"}
         </button>
 
-        <div className="flex flex-wrap gap-4 text-xs text-gem-muted pt-1 border-t border-gem-border">
-          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-gem-green" /> Strong (fuzzy above 90)</span>
-          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-gem-blue" /> Likely (TF-IDF above 0.65)</span>
-          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-purple-500" /> Possible (embedding above 0.75)</span>
-          <span className="flex items-center gap-1.5 pt-3"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" /> Weak (review)</span>
+        <div className="flex flex-wrap items-center gap-4 text-xs text-gem-muted pt-1 border-t border-gem-border">
+          <span className="pt-3 text-gem-muted">Match strength (red = highest, green = lowest):</span>
+          {[
+            ["Strong (fuzzy above 90)", 4],
+            ["Likely (TF-IDF above 0.65)", 3],
+            ["Possible (embedding above 0.75)", 2],
+            ["Weak (review)", 1],
+          ].map(([label, rank]) => (
+            <span key={label} className="flex items-center gap-1.5 pt-3">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: heatStyle(rank, 1, 4).color }} /> {label}
+            </span>
+          ))}
         </div>
       </div>
 
@@ -632,13 +1001,13 @@ export default function ComparisonDashboard() {
               </div>
               {confidentCount !== null && (
                 <div>
-                  <p className="text-2xl font-bold text-gem-green">{confidentCount.toLocaleString()}</p>
+                  <p className="text-2xl font-bold text-gem-red">{confidentCount.toLocaleString()}</p>
                   <p className="text-xs text-gem-muted">Confident matches</p>
                 </div>
               )}
               {weakCount !== null && (
                 <div>
-                  <p className="text-2xl font-bold text-amber-600">{weakCount.toLocaleString()}</p>
+                  <p className="text-2xl font-bold text-gem-green">{weakCount.toLocaleString()}</p>
                   <p className="text-xs text-gem-muted">Weak, needs review</p>
                 </div>
               )}
@@ -656,6 +1025,7 @@ export default function ComparisonDashboard() {
                 ["list", "Comparison List"],
                 ["analytics", "Comparison Analytics"],
                 ["analysis", "Analysis"],
+                ["departments", "Top Departments"],
               ].map(([id, label], i) => (
                 <button
                   key={id}
@@ -679,6 +1049,11 @@ export default function ComparisonDashboard() {
             <AnalysisView rows={result.rows} />
           )}
 
+          {/* Top Departments — top 10 orgs by Custom Bid usage, with drill-down */}
+          {result.rows && result.rows.length > 0 && resultView === "departments" && (
+            <TopDepartmentsView rows={result.rows} />
+          )}
+
           {/* List — the full result table, every row, all columns (no cap) */}
           {result.rows && result.rows.length > 0 && resultView === "list" && (
             <div className="gem-card overflow-hidden">
@@ -694,18 +1069,22 @@ export default function ComparisonDashboard() {
                     </tr>
                   </thead>
                   <tbody>
-                    {result.rows.map((row, i) => (
-                      <tr key={i}>
-                        <td className="font-mono text-xs text-gem-blue whitespace-nowrap">{row["Bid No"]}</td>
-                        <td className="text-gem-text text-xs">{row["Department"] || "—"}</td>
-                        <td className="text-gem-text max-w-xs">{row["Item Category"]}</td>
-                        <td className="text-gem-text max-w-xs">{row["Matched Category"]}</td>
-                        <td className="whitespace-nowrap">
-                          <span className={`gem-badge ${verdictStyle(row)}`}>{row["Match Label"]}</span>
-                        </td>
-                        <td className="whitespace-nowrap text-gem-muted text-xs">{row["Match Score"]}</td>
-                      </tr>
-                    ))}
+                    {result.rows.map((row, i) => {
+                      // Red for the highest match %, green for the lowest.
+                      const hs = heatStyle(parseFloat(row["Match Score"]), loScore, hiScore);
+                      return (
+                        <tr key={i}>
+                          <td className="font-mono text-xs text-gem-blue whitespace-nowrap">{row["Bid No"]}</td>
+                          <td className="text-gem-text text-xs">{row["Department"] || "—"}</td>
+                          <td className="text-gem-text max-w-xs">{row["Item Category"]}</td>
+                          <td className="text-gem-text max-w-xs">{row["Matched Category"]}</td>
+                          <td className="whitespace-nowrap">
+                            <span className="gem-badge" style={hs}>{row["Match Label"]}</span>
+                          </td>
+                          <td className="whitespace-nowrap text-xs font-semibold" style={{ color: hs.color }}>{row["Match Score"]}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

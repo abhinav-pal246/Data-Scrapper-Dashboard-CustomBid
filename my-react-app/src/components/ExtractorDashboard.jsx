@@ -15,6 +15,13 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
   const startRef = useRef(null);
   const pollRef  = useRef(null);
 
+  // ── Delivery-state filter (empty selection = All States, i.e. no filter) ──
+  const [stateOptions, setStateOptions]     = useState([]);
+  const [selectedStates, setSelectedStates] = useState([]);
+  const [stateQuery, setStateQuery]         = useState("");
+  const [pickerOpen, setPickerOpen]         = useState(false);
+  const pickerRef = useRef(null);
+
   const ACTIVE = ["running", "paused", "retrying", "hold"];
 
   useEffect(() => {
@@ -42,6 +49,29 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
     return () => clearInterval(pollRef.current);
   }, [status, base]);
 
+  // Load the canonical state list once (shared by both extractor modules).
+  useEffect(() => {
+    fetch(`${API}/api/states`)
+      .then((r) => r.json())
+      .then((d) => setStateOptions(d.states || []))
+      .catch(() => {});
+  }, []);
+
+  // Close the state picker on an outside click.
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onDoc = (e) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target)) setPickerOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [pickerOpen]);
+
+  const toggleState = (s) =>
+    setSelectedStates((prev) => (prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]));
+  const filteredStateOptions = stateOptions.filter((s) =>
+    s.toLowerCase().includes(stateQuery.trim().toLowerCase()));
+
   const post = (path) => fetch(`${base}/${path}`, { method: "POST" });
 
   const handleStart = async () => {
@@ -55,7 +85,7 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
     setTimeLeft(null);
     const res = await fetch(`${base}/start`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ count: allBids ? "all" : count }),
+      body: JSON.stringify({ count: allBids ? "all" : count, states: selectedStates }),
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
@@ -103,6 +133,91 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
                      className="w-4 h-4 accent-gem-blue" />
               <span className="text-sm text-gem-text">Retrieve all active bids</span>
             </label>
+
+            {/* State filter — searchable multi-select (empty = All States) */}
+            <div ref={pickerRef} className="relative">
+              <label className="gem-label">Filter by delivery state</label>
+              <button
+                type="button"
+                onClick={() => setPickerOpen((o) => !o)}
+                className="gem-input w-full flex items-center justify-between text-left"
+              >
+                <span className={selectedStates.length ? "text-gem-text" : "text-gem-muted"}>
+                  {selectedStates.length === 0
+                    ? "All States"
+                    : `${selectedStates.length} state${selectedStates.length > 1 ? "s" : ""} selected`}
+                </span>
+                <svg className={`w-4 h-4 text-gem-muted shrink-0 transition-transform ${pickerOpen ? "rotate-180" : ""}`}
+                     viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                  <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.17l3.71-3.94a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                </svg>
+              </button>
+
+              {pickerOpen && (
+                <div className="absolute z-20 mt-1 w-full rounded-lg border border-gem-border bg-white shadow-lg overflow-hidden">
+                  <div className="p-2 border-b border-gem-border">
+                    <input
+                      autoFocus
+                      value={stateQuery}
+                      onChange={(e) => setStateQuery(e.target.value)}
+                      placeholder="Search states"
+                      className="gem-input py-1.5 text-sm"
+                    />
+                  </div>
+                  <div className="max-h-56 overflow-y-auto py-1">
+                    <button type="button"
+                      onClick={() => { setSelectedStates([]); setStateQuery(""); }}
+                      className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-sm text-left hover:bg-slate-50 ${selectedStates.length === 0 ? "text-gem-blue font-medium" : "text-gem-text"}`}>
+                      <span className={`w-4 h-4 rounded border flex items-center justify-center text-[10px] leading-none ${selectedStates.length === 0 ? "bg-gem-blue border-gem-blue text-white" : "border-gem-border"}`}>
+                        {selectedStates.length === 0 && "✓"}
+                      </span>
+                      All States
+                    </button>
+                    {filteredStateOptions.map((s) => {
+                      const on = selectedStates.includes(s);
+                      return (
+                        <button key={s} type="button" onClick={() => toggleState(s)}
+                          className="w-full flex items-center gap-2.5 px-3 py-1.5 text-sm text-left text-gem-text hover:bg-slate-50">
+                          <span className={`w-4 h-4 rounded border flex items-center justify-center text-[10px] leading-none ${on ? "bg-gem-blue border-gem-blue text-white" : "border-gem-border"}`}>
+                            {on && "✓"}
+                          </span>
+                          {s}
+                        </button>
+                      );
+                    })}
+                    {filteredStateOptions.length === 0 && (
+                      <p className="px-3 py-2 text-xs text-gem-muted">No states match “{stateQuery}”.</p>
+                    )}
+                  </div>
+                  {selectedStates.length > 0 && (
+                    <div className="flex items-center justify-between px-3 py-2 border-t border-gem-border bg-slate-50">
+                      <span className="text-xs text-gem-muted">{selectedStates.length} selected</span>
+                      <button type="button" onClick={() => setSelectedStates([])}
+                              className="text-xs text-gem-link underline">Clear all</button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {selectedStates.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {selectedStates.map((s) => (
+                    <span key={s} className="gem-badge text-gem-blue bg-blue-50 border-blue-200 inline-flex items-center gap-1">
+                      {s}
+                      <button type="button" onClick={() => toggleState(s)}
+                              className="text-gem-blue/60 hover:text-gem-blue leading-none text-sm">×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              <p className="gem-help mt-1.5">
+                {selectedStates.length === 0
+                  ? "Extracting from all states. Select one or more states to keep only bids delivered there."
+                  : `Only bids delivered to the selected ${selectedStates.length > 1 ? "states" : "state"} are kept — the count above is how many matching bids to collect. State is derived from each bid’s consignee address.`}
+              </p>
+            </div>
+
             <button onClick={handleStart} className={`gem-btn ${startBtn} w-full py-3`}>
               Start Extraction
             </button>
@@ -165,7 +280,10 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
                 <div className={`h-2.5 rounded-full transition-all duration-500 ${barColor}`} style={{ width: `${pct}%` }} />
               </div>
               <div className="flex justify-between text-xs mt-2">
-                <span className="text-gem-muted">{job.failed > 0 && `${job.failed} skipped`}</span>
+                <span className="text-gem-muted">
+                  {[job.filtered > 0 && `${job.filtered} other states`,
+                    job.failed > 0 && `${job.failed} skipped`].filter(Boolean).join(" · ")}
+                </span>
                 <span className={status === "paused" ? "text-amber-600" : "text-gem-blue"}>
                   {pct}%{status !== "paused" && ` · ${fmt(timeLeft)}`}
                 </span>
@@ -210,7 +328,9 @@ export default function ExtractorDashboard({ module, title, subtitle, accent = "
             <div className="mx-auto w-12 h-12 rounded-full bg-green-100 text-gem-green flex items-center justify-center text-2xl">✓</div>
             <p className="text-gem-text font-semibold text-lg">Extraction complete</p>
             <p className="text-gem-muted text-sm">
-              {job.written} active bids extracted{job.failed > 0 && `. ${job.failed} skipped`}.
+              {job.written} active bids extracted
+              {job.filtered > 0 && `. ${job.filtered} in other states`}
+              {job.failed > 0 && `. ${job.failed} skipped`}.
             </p>
             <button onClick={handleDownload} className="gem-btn gem-btn-success w-full py-3">Download CSV</button>
             <button onClick={reset} className="gem-btn gem-btn-ghost w-full">Start a new extraction</button>

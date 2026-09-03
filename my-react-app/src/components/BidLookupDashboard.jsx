@@ -3,11 +3,12 @@ import { useState, useRef } from "react";
 const API = ""; // same-origin; Vite proxies /api -> Flask (see vite.config.js)
 const BID_RE = /^GEM\/\d{4}\/[A-Z]\/\d+$/i;
 
-// ≥70 green · 40–69 amber · <40 red
+// Match-strength scale (consistent with the Comparison section): RED = closest
+// match (highest %), amber mid, GREEN = weakest (lowest %).
 function scoreStyle(pct) {
-  if (pct >= 70) return "text-gem-green bg-green-50 border-green-300";
+  if (pct >= 70) return "text-gem-red bg-red-50 border-red-300";
   if (pct >= 40) return "text-amber-700 bg-amber-50 border-amber-300";
-  return "text-gem-red bg-red-50 border-red-300";
+  return "text-gem-green bg-green-50 border-green-300";
 }
 
 let _id = 0;
@@ -69,9 +70,9 @@ export default function BidLookupDashboard() {
         <p className="gem-help">A complete bid number runs a live lookup. Partial text filters the results below.</p>
         {note && <p className="text-xs text-amber-700">{note}</p>}
         <div className="flex flex-wrap gap-4 text-xs text-gem-muted pt-1">
-          <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-gem-green" /> 70% and above (close)</span>
+          <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-gem-red" /> 70% and above (close)</span>
           <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" /> 40 to 69% (review)</span>
-          <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-gem-red" /> Below 40% (weak)</span>
+          <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-gem-green" /> Below 40% (weak)</span>
         </div>
       </div>
 
